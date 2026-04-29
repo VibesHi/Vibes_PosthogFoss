@@ -1,0 +1,292 @@
+# Self-Hosted PostHog (production-ish)
+
+Run PostHog from your forked repo with locally-built images, no upstream
+registry, no separate installer binary. Optimized for a single-host VPS
+deployment that you can patch and redeploy from `git`.
+
+## Files
+
+| Path                          | Purpose                                                 |
+|-------------------------------|---------------------------------------------------------|
+| `docker-compose.prod.yml`     | Production compose file (forked from `docker-compose.hobby.yml`) |
+| `bin/setup-prod`              | Idempotent per-host bootstrap script                    |
+| `.env.example.prod`           | Template for `.env` (manual, NOT generated)             |
+| `compose/start`               | Web entrypoint (created by `setup-prod`)                |
+| `compose/temporal-django-worker` | Temporal worker entrypoint (created by `setup-prod`) |
+| `compose/wait`                | TCP wait-for-deps script (created by `setup-prod`)      |
+| `share/GeoLite2-City.mmdb`    | GeoIP database (downloaded by `setup-prod`)             |
+
+## First-run
+
+```bash
+# 1. Copy the env template and fill it in
+cp .env.example.prod .env
+$EDITOR .env
+
+# 2. Bootstrap (validates .env, scaffolds compose/, downloads GeoIP, builds, starts)
+bin/setup-prod
+```
+
+### Quick `.env` setup
+
+```bash
+cp .env.example.prod .env
+sed -i.bak 's|CHANGE_ME_your.domain.tld|posthog.example.com|' .env
+sed -i.bak "s|CHANGE_ME_run_openssl_rand_hex_32|$(openssl rand -hex 32)|" .env
+sed -i.bak "s|CHANGE_ME_run_openssl_rand_hex_16|$(openssl rand -hex 16)|" .env
+sed -i.bak "s|CHANGE_ME_postgres_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
+sed -i.bak "s|CHANGE_ME_minio_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
+sed -i.bak "s|CHANGE_ME_clickhouse_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
+rm .env.bak
+bin/setup-prod
+```
+
+## Subsequent deploys (after code changes)
+
+```bash
+git pull
+bin/setup-prod          # rebuilds only changed layers, restarts changed services
+```
+
+For a hard restart of a single service:
+
+```bash
+docker compose up -d --build --force-recreate web
+```
+
+> **Note:** `COMPOSE_PROJECT_NAME=posthog` and `COMPOSE_FILE=docker-compose.prod.yml`
+> are set in `.env`, so plain `docker compose ...` works from the repo root.
+> Prefix with `sudo` if you're not root and not in the `docker` group.
+
+## What `bin/setup-prod` does
+
+1. **Validates `.env`** — fails fast if missing, if any `CHANGE_ME_*` sentinel
+   remains, or if any of `DOMAIN`, `POSTHOG_SECRET`, `ENCRYPTION_SALT_KEYS`,
+   `POSTHOG_DB_PASSWORD`, `OBJECT_STORAGE_PASSWORD`, `CLICKHOUSE_PASSWORD` is
+   empty. Also warns if any password is shorter than 16 characters.
+2. **Generates `compose/start`, `compose/temporal-django-worker`, `compose/wait`**
+   — only if they don't already exist (so your edits survive re-runs).
+3. **Downloads `share/GeoLite2-City.mmdb`** — only if missing. Auto-installs
+   `brotli` via `apt` if needed.
+4. **Builds and starts** via `docker compose -f docker-compose.prod.yml`.
+5. **Applies idempotent ClickHouse TTLs** — `MODIFY TTL` on
+   `sharded_log_entries` and `sharded_query_log_archive` (configurable via
+   `POSTHOG_LOG_ENTRIES_TTL_DAYS` / `POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS`).
+
+The script does **not** generate `.env` — fully manual.
+
+## Usage notes
+
+- **`COMPOSE_FILE` is locked to `docker-compose.prod.yml` via `.env`.** Don't
+  manually add `docker-compose.base.yml` to it — that drags in dev-only services
+  (`kafka_ui`, `flower`, `opensearch`, `localstack`, `maildev`, `otel-collector`,
+  `jaeger`, `duckgres`, `capture-ai`, `capture-logs`). The `extends:` directives
+  inside prod.yml already pull from base.yml.
+- **Don't run `docker compose pull`.** All custom services have local-only
+  image names (`posthog-app`, `posthog-node`, `posthog-<rust-bin>`); a `pull`
+  would error on missing remote tags. Only third-party images
+  (`postgres`, redpanda for `kafka-init`) are pullable.
+- **First build is slow** (~20-40 min) — Python deps, frontend bundle, Rust
+  compilation. Subsequent builds are minutes thanks to BuildKit cache.
+
+## Logs and ops
+
+```bash
+docker compose ps
+docker compose logs -f web worker
+docker compose restart plugins
+docker compose down                  # stop all
+docker compose down -v               # stop AND wipe volumes (DESTRUCTIVE)
+```
+
+---
+
+## What we changed in `docker-compose.prod.yml` vs upstream `docker-compose.hobby.yml`
+
+The prod file is a fork of `docker-compose.hobby.yml` with three categories of changes.
+
+### 1. Path corrections — running from the repo root
+
+The hobby installer clones the repo into `./posthog/`, so its compose file
+references `./posthog/posthog/idl`, `./posthog/docker/clickhouse/...`, etc.
+We run from the repo root (where `docker-compose.prod.yml` itself lives), so
+those `./posthog/` prefixes are wrong.
+
+| Service              | Before (`hobby.yml`)                                | After (`prod.yml`)                          |
+|----------------------|-----------------------------------------------------|---------------------------------------------|
+| `clickhouse` volumes | `./posthog/posthog/idl:/idl`                        | `./posthog/idl:/idl`                        |
+|                      | `./posthog/docker/clickhouse/...`                   | `./docker/clickhouse/...`                   |
+|                      | `./posthog/posthog/user_scripts:...`                | `./posthog/user_scripts:...`                |
+| `temporal` volumes   | `./posthog/docker/temporal/dynamicconfig:...`       | `./docker/temporal/dynamicconfig:...`       |
+| `livestream` volumes | `./posthog/docker/livestream/configs-hobby.yml:...` | `./docker/livestream/configs-hobby.yml:...` |
+| Rust services build  | `context: ./posthog/rust`                           | `context: ./rust`                           |
+
+Total: 14 path fixes.
+
+### 2. Local builds instead of registry pulls
+
+Hobby pulls images from `posthog/posthog:$POSTHOG_APP_TAG` (Docker Hub) and
+`posthog/posthog-node:$POSTHOG_NODE_TAG`. We build from source in this repo.
+
+Added `build:` directives:
+
+| Services                                                                    | Build directive                          | Image tag           |
+|-----------------------------------------------------------------------------|------------------------------------------|---------------------|
+| `web`, `worker`, `asyncmigrationscheck`, `temporal-django-worker`           | `build: .`                               | `posthog-app`       |
+| `plugins`, `ingestion-general`, `ingestion-sessionreplay`, `recording-api`, `ingestion-error-tracking`, `ingestion-logs`, `ingestion-traces` | `build: { context: ., dockerfile: Dockerfile.node }` | `posthog-node` |
+| `cyclotron-janitor`, `capture`, `replay-capture`, `property-defs-rs`, `feature-flags`, `hypercache-server`, `cymbal` | `build: { context: ./rust }` (with `BIN` arg from base.yml) | `posthog-<bin>` |
+| `livestream`                                                                | `build: { context: ./livestream }`       | `posthog-livestream` |
+
+The `BIN` build arg for each Rust service (e.g. `BIN: capture`) is inherited
+from `docker-compose.base.yml` via `extends:`.
+
+### 3. Image tag overrides
+
+Hobby uses `image: $REGISTRY_URL:$POSTHOG_APP_TAG` (Python) and
+`image: ${REGISTRY_URL}-node:${POSTHOG_NODE_TAG:-latest}` (Node). Without a
+registry, those tags are meaningless. We replaced them with stable local tags:
+
+```diff
+- image: $REGISTRY_URL:$POSTHOG_APP_TAG          # web, worker, etc.
++ image: posthog-app
+
+- image: ${REGISTRY_URL}-node:${POSTHOG_NODE_TAG:-latest}    # plugins, ingestion-*
++ image: posthog-node
+
+- image: ghcr.io/posthog/posthog/cymbal:master   # cymbal
++ image: posthog-cymbal
+```
+
+Rust services in upstream hobby inherit `image: ghcr.io/posthog/posthog/<bin>:master`
+from `docker-compose.base.yml` via `extends:`. We override that inheritance in
+`prod.yml` so a stray `docker compose pull` can't replace your local build with
+an upstream one:
+
+```yaml
+capture:
+    image: posthog-capture          # added in prod.yml — overrides base.yml's ghcr.io tag
+    build:
+        context: ./rust
+    extends:
+        file: docker-compose.base.yml
+        service: capture
+```
+
+### Why share `posthog-app` and `posthog-node` across services?
+
+Compose dedups builds when multiple services share the same `image:` + `build:`
+context. Sharing one tag for the 4 Python services (which all use `Dockerfile`
+at the repo root) means **one build, four containers**. Same for the 7 Node
+services sharing `Dockerfile.node`. Net result:
+
+- 1× Python build (`posthog-app`)
+- 1× Node build (`posthog-node`)
+- 7× Rust builds (one per binary, since each has a different `BIN` arg)
+- 1× Go build (`posthog-livestream`)
+
+Total: 10 builds for ~19 services.
+
+### 4. Hardening fixes vs hobby (NOT in upstream)
+
+These address known issues that surface in real production within weeks/months
+on a default hobby install.
+
+| Fix | Where | Reason |
+|---|---|---|
+| `ZOO_AUTOPURGE_PURGEINTERVAL=24` + `ZOO_AUTOPURGE_SNAPRETAINCOUNT=3` on `zookeeper` | prod.yml | Without these, ZK transaction logs grow unbounded — can reach hundreds of GB on busy installs in a few weeks. |
+| `objectstorage` ports rebound to `127.0.0.1:` | prod.yml | Hobby exposes MinIO admin console + API on `0.0.0.0:19000-19001` with default `object_storage_root_user`/`password`. Caddy already proxies the public `/posthog/*` path internally — no need for direct port exposure. |
+| `temporal` + `temporal-ui` ports rebound to `127.0.0.1:` | prod.yml | Hobby exposes Temporal gRPC (`:7233`) and Web UI (`:8081`) on `0.0.0.0` with no auth. Anyone with the host IP can `tctl` workflow histories, cancel jobs, or start new ones. Tunnel via SSH when you need to debug. |
+| `<<: *restart-prod` (`unless-stopped`) on all long-running services | prod.yml | Base.yml uses `restart: on-failure`, which does NOT restart on clean exit (code 0). Some ingestion services exit cleanly under specific conditions and stay down without this. |
+| `kafka-init` enhanced with `rpk cluster config set log_retention_ms` + topic-level `alter-config` | prod.yml | base.yml's `--mode dev-container` silently ignores broker-level retention env vars. Without cluster + topic-level overrides, Redpanda disk usage grows linearly until full. |
+| ClickHouse `system_log` TTLs via `docker/clickhouse/config.d.prod/system_log_ttl.xml` | new file, mounted in prod.yml | Without TTLs, `query_log` / `trace_log` / `metric_log` / `part_log` grow unbounded — tens of GB in a few weeks on a busy install. Now 7d retention. |
+| `CLICKHOUSE_SERVER_IMAGE` pinning via `.env` | prod.yml | Reproducible deploys; prevents silent CH version drift across hosts. |
+| `POSTHOG_DB_PASSWORD`, `OBJECT_STORAGE_PASSWORD`, `CLICKHOUSE_PASSWORD` from `.env` | `.env.example.prod`, prod.yml, `docker/clickhouse/users.d.prod/default-password.xml` | Hobby ships with well-known defaults (`posthog`/`posthog`, empty CH `default`, `object_storage_root_password`). Anyone with shell or `docker exec` access on the host can dump data with these. See [Credentials](#credentials) below. |
+
+### Credentials
+
+Three secrets in `.env` swap the well-known defaults baked into upstream
+`docker-compose.base.yml` / `docker/clickhouse/users.xml` / `dev-services.env`:
+
+| `.env` variable          | Replaces default                       | Used by                                                                    |
+|--------------------------|----------------------------------------|----------------------------------------------------------------------------|
+| `POSTHOG_DB_PASSWORD`    | `posthog` (Postgres `posthog` user)    | Django (web/worker), Temporal, all Node ingestion, Rust services           |
+| `OBJECT_STORAGE_PASSWORD`| `object_storage_root_password` (MinIO) | `worker`, `web`, `plugins`, `temporal-django-worker` for replay/exports/blobs |
+| `CLICKHOUSE_PASSWORD`    | `` (empty CH `default` user password)  | Django + all CH clients; CH server reads it via `from_env` at startup      |
+
+**Implementation:**
+
+- A YAML anchor `&pg-env` at the top of `prod.yml` defines all 9 PG URL flavors
+  (`DATABASE_URL`, `PERSONS_DATABASE_URL`, `WRITE_DATABASE_URL`, …, `PERSONS_URL`,
+  `PGPASSWORD`, etc.) once. Every service that talks to Postgres merges it via
+  `<<: *pg-env` — keeps the password in one place, prevents drift.
+- `docker/clickhouse/users.d.prod/default-password.xml` overrides the empty
+  `default` user password using `<password from_env="CLICKHOUSE_PASSWORD" />`.
+  CH expands `from_env` at config-parse time — same pattern already used by
+  `kafka_broker_list` in `docker/clickhouse/config.d/default.xml`.
+- Usernames are NOT parameterized. `posthog` (PG), `object_storage_root_user`
+  (MinIO), `default` (CH) stay as-is. Renaming them touches PG init scripts,
+  MinIO bucket bootstrap, and Django settings — high blast radius for zero
+  marginal security gain.
+- The `api`/`apppass` and `app`/`apppass` users in `docker/clickhouse/users.xml`
+  are unused by any prod service (they're consumed only by `bin/start-worker`,
+  `bin/start-celery`, `bin/start-backend` — local dev scripts, not the
+  `compose/start` flow). Left untouched.
+
+**Operational consequence:** Direct `clickhouse-client` invocations now need
+the password:
+
+```bash
+docker compose exec clickhouse clickhouse-client \
+    --password="$(grep ^CLICKHOUSE_PASSWORD .env | cut -d= -f2)" \
+    --query "SELECT count() FROM posthog.events"
+```
+
+Same for `psql`:
+
+```bash
+docker compose exec db psql -U posthog -d posthog
+# Will prompt for password, or set PGPASSWORD env var first.
+```
+
+**Live rotation is not supported.** Changing a password in `.env` after first
+boot will desync clients from the running services. Set them once before the
+first `bin/setup-prod`. To rotate later: `ALTER USER` in PG, replace MinIO
+secret + reset bucket policy, then update `.env` and restart all services in
+the right order.
+
+### Things we kept from hobby
+
+- Upstream third-party images (`postgres:15.12-alpine`, redpanda for
+  `kafka-init`, `clickhouse/clickhouse-server`, `redis`, `zookeeper`,
+  `caddy`, `minio`, `seaweedfs`, `temporalio/*`, `elasticsearch`) — these
+  aren't part of PostHog source, no reason to fork.
+- All env wiring (`OBJECT_STORAGE_*`, `SESSION_RECORDING_V2_*`, `OTEL_*`, etc.)
+- Caddy reverse proxy on `:80`/`:443` with auto-TLS via Let's Encrypt.
+
+### Required env vars
+
+`.env.example.prod` lists everything. Required:
+
+- `DOMAIN` — your hostname
+- `POSTHOG_SECRET` — Django secret (`openssl rand -hex 32`)
+- `ENCRYPTION_SALT_KEYS` — token encryption (`openssl rand -hex 16`)
+- `POSTHOG_DB_PASSWORD` — Postgres `posthog` user (`openssl rand -hex 24`)
+- `OBJECT_STORAGE_PASSWORD` — MinIO root (`openssl rand -hex 24`)
+- `CLICKHOUSE_PASSWORD` — ClickHouse `default` user (`openssl rand -hex 24`)
+
+Optional:
+
+- `TLS_BLOCK` — Caddy custom TLS config (empty = auto Let's Encrypt)
+- `OPT_OUT_CAPTURE` — disable PostHog's own telemetry (recommended: `true`)
+- `SEAWEEDFS_DOCKER_NAME`, `DOCKER_REGISTRY_PREFIX` — niche overrides
+- `CLICKHOUSE_SERVER_IMAGE` — pin CH version (default `26.3.9.8`)
+- `KAFKA_LOG_RETENTION_MS`, `KAFKA_LOG_SEGMENT_SIZE` — Redpanda retention
+  (defaults: 1h / 128 MB)
+- `CLICKHOUSE_SYSTEM_LOG_TTL_DAYS` — CH `system_log` TTL (default 7)
+- `POSTHOG_LOG_ENTRIES_TTL_DAYS` — Hog function logs TTL (default 14)
+- `POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS` — query archive TTL (default 30)
+
+**No longer required** (vs upstream hobby): `REGISTRY_URL`, `POSTHOG_APP_TAG`,
+`POSTHOG_NODE_TAG` — all image references in `prod.yml` are hardcoded local tags.
+
+---

@@ -1,0 +1,738 @@
+#
+# `docker-compose` file for production-ish self-hosted deployments.
+# Forked from docker-compose.hobby.yml with two changes:
+#   1) Path fixes for running from the repo root (no parent ./posthog/ wrapper).
+#   2) Local builds for Python (Dockerfile) and Node (Dockerfile.node) images.
+#
+# Compose with:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Do NOT pass docker-compose.base.yml in -f / COMPOSE_FILE — `extends:` already
+# pulls from it. Listing both also drags in dev-only services (kafka_ui, flower,
+# opensearch, localstack, maildev, otel-collector, jaeger, duckgres, capture-ai,
+# capture-logs).
+#
+
+x-logging: &default-logging
+    driver: json-file
+    options:
+        max-size: '50m'
+        max-file: '3'
+
+# Override base.yml's `restart: on-failure` for long-running services.
+# `on-failure` does NOT restart on clean exit (code 0), so any service that
+# self-terminates (panic-handled, OOM-killed cleanly, etc.) stays down until
+# the next compose up. Use `unless-stopped` to keep them alive across reboots
+# while still respecting an explicit `docker compose stop`.
+x-restart-prod: &restart-prod
+    restart: unless-stopped
+
+# Postgres connection env block. Swaps the `posthog`/`posthog` default that
+# dev-services.env + base.yml hardcode. Merged into every service that talks
+# to Postgres via `<<: *pg-env`. Unused vars (e.g. PERSONS_URL on a service
+# that doesn't read it) are harmless — Django/Node/Rust services only read
+# what they need.
+#
+# Note: env_file from base.yml takes LOWER priority than environment: keys
+# in the same service, so spreading these here cleanly overrides the hardcoded
+# `postgres://posthog:posthog@db:5432/posthog` values from dev-services.env.
+x-pg-env: &pg-env
+    DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    PERSONS_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    BEHAVIORAL_COHORTS_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    CYCLOTRON_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    WRITE_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    READ_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    PERSONS_WRITE_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    PERSONS_READ_DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    PERSONS_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+    PGPASSWORD: ${POSTHOG_DB_PASSWORD}
+    PGUSER: posthog
+    PGHOST: db
+
+services:
+    db:
+        extends:
+            file: docker-compose.base.yml
+            service: db
+        image: ${DOCKER_REGISTRY_PREFIX:-}postgres:15.12-alpine
+        logging: *default-logging
+        # Overrides the `posthog` default password from base.yml. POSTGRES_USER
+        # and POSTGRES_DB stay as `posthog` — only the password is parameterized.
+        environment:
+            POSTGRES_PASSWORD: ${POSTHOG_DB_PASSWORD}
+        volumes:
+            - postgres-data:/var/lib/postgresql/data
+
+    redis7:
+        extends:
+            file: docker-compose.base.yml
+            service: redis7
+        logging: *default-logging
+        volumes:
+            - redis7-data:/data
+
+    clickhouse:
+        #
+        # Note: please keep the default version in sync across
+        #       `posthog` and the `charts-clickhouse` repos
+        #
+        extends:
+            file: docker-compose.base.yml
+            service: clickhouse
+        # Pin via .env (CLICKHOUSE_SERVER_IMAGE) for reproducible deploys.
+        # base.yml falls back to 26.3.9.8 if unset.
+        image: ${CLICKHOUSE_SERVER_IMAGE:-clickhouse/clickhouse-server:26.3.9.8}
+        restart: on-failure
+        logging: *default-logging
+        # CLICKHOUSE_PASSWORD is read by the server itself (consumed by users.d.prod
+        # overlay via `from_env` for the `default` user's <password> tag). The
+        # `default` user becomes password-protected after first start.
+        environment:
+            CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+        depends_on:
+            - kafka
+            - zookeeper
+        volumes:
+            - ./posthog/idl:/idl
+            - ./docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+            - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+            - ./docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml
+            # Prod-only overlay: system_log table TTLs. Without this, query_log /
+            # trace_log / metric_log / part_log grow unbounded — tens of GB on
+            # busy installs in a few weeks.
+            - ./docker/clickhouse/config.d.prod/system_log_ttl.xml:/etc/clickhouse-server/config.d/system_log_ttl.xml
+            - ./docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
+            # Prod-only overlay: sets a password on the `default` user via from_env.
+            # Without this, anyone with shell access to the host can `docker exec
+            # clickhouse clickhouse-client` and dump everything.
+            - ./docker/clickhouse/users.d.prod/default-password.xml:/etc/clickhouse-server/users.d/default-password.xml
+            - ./docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
+            - ./posthog/user_scripts:/var/lib/clickhouse/user_scripts
+            - clickhouse-data:/var/lib/clickhouse
+
+    zookeeper:
+        extends:
+            file: docker-compose.base.yml
+            service: zookeeper
+        logging: *default-logging
+        # Without these, transaction logs grow unbounded — base.yml has no
+        # autopurge. ZK datalog can reach hundreds of GB on busy installs in
+        # a few weeks.
+        environment:
+            ZOO_AUTOPURGE_PURGEINTERVAL: 24
+            ZOO_AUTOPURGE_SNAPRETAINCOUNT: 3
+        volumes:
+            - zookeeper-datalog:/datalog
+            - zookeeper-data:/data
+            - zookeeper-logs:/logs
+    kafka:
+        extends:
+            file: docker-compose.base.yml
+            service: kafka
+        logging: *default-logging
+        depends_on:
+            - zookeeper
+        environment:
+            KAFKA_LOG_RETENTION_MS: 3600000
+            KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+            KAFKA_LOG_RETENTION_HOURS: 1
+        volumes:
+            - kafka-data:/bitnami/kafka
+
+    worker:
+        <<: *restart-prod
+        image: posthog-app
+        build: .
+        extends:
+            file: docker-compose.base.yml
+            service: worker
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            SESSION_RECORDING_V2_S3_ENDPOINT: http://seaweedfs:8333
+            SESSION_RECORDING_V2_S3_ACCESS_KEY_ID: 'any'
+            SESSION_RECORDING_V2_S3_SECRET_ACCESS_KEY: 'any'
+            OBJECT_STORAGE_ENABLED: true
+            RECORDING_API_URL: http://recording-api:6738
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            POSTHOG_SKIP_MIGRATION_CHECKS: '1'
+        depends_on:
+            db:
+                condition: service_healthy
+            redis7:
+                condition: service_healthy
+            clickhouse:
+                condition: service_started
+            kafka:
+                condition: service_healthy
+            web:
+                condition: service_started
+    web:
+        <<: *restart-prod
+        image: posthog-app
+        build: .
+        extends:
+            file: docker-compose.base.yml
+            service: web
+        command: /compose/start
+        logging: *default-logging
+        volumes:
+            - ./compose:/compose
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            LIVESTREAM_HOST: 'https://${DOMAIN}/livestream'
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+            SESSION_RECORDING_V2_S3_ACCESS_KEY_ID: 'any'
+            SESSION_RECORDING_V2_S3_SECRET_ACCESS_KEY: 'any'
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            SESSION_RECORDING_V2_S3_ENDPOINT: http://seaweedfs:8333
+            OBJECT_STORAGE_ENABLED: true
+            RECORDING_API_URL: http://recording-api:6738
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            OTEL_SERVICE_NAME: 'posthog'
+            OTEL_EXPORTER_OTLP_ENDPOINT: ''
+            OTEL_SDK_DISABLED: 'true'
+            OPT_OUT_CAPTURE: ${OPT_OUT_CAPTURE:-false}
+            DEPLOYMENT: 'hobby'
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+            - seaweedfs
+
+    plugins:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: plugins
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            OBJECT_STORAGE_ENABLED: true
+            CDP_REDIS_HOST: redis7
+            CDP_REDIS_PORT: 6379
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            OTEL_EXPORTER_OTLP_ENDPOINT: ''
+        volumes:
+            - ./share:/share
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+            - seaweedfs
+
+    ingestion-general:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: ingestion-general
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+
+    ingestion-sessionreplay:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: ingestion-sessionreplay
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            SESSION_RECORDING_V2_S3_ACCESS_KEY_ID: 'any'
+            SESSION_RECORDING_V2_S3_SECRET_ACCESS_KEY: 'any'
+            SESSION_RECORDING_V2_S3_TIMEOUT_MS: 120000
+            SESSION_RECORDING_V2_S3_ENDPOINT: http://seaweedfs:8333
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        depends_on:
+            - db
+            - redis7
+            - kafka
+            - seaweedfs
+
+    recording-api:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: recording-api
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+
+    ingestion-error-tracking:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: ingestion-error-tracking
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        depends_on:
+            - db
+            - redis7
+            - kafka
+
+    ingestion-logs:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: ingestion-logs
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+        depends_on:
+            - db
+            - redis7
+            - kafka
+
+    ingestion-traces:
+        <<: *restart-prod
+        image: posthog-node
+        build:
+            context: .
+            dockerfile: Dockerfile.node
+        extends:
+            file: docker-compose.base.yml
+            service: ingestion-traces
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+        depends_on:
+            - db
+            - redis7
+            - kafka
+
+    proxy:
+        extends:
+            file: docker-compose.base.yml
+            service: proxy
+        logging: *default-logging
+        ports:
+            - '80:80'
+            - '443:443'
+        volumes:
+            - caddy-data:/data
+            - caddy-config:/config
+        environment:
+            CADDY_TLS_BLOCK: $TLS_BLOCK
+            CADDY_HOST: '$DOMAIN, http://, https://'
+        depends_on:
+            - web
+            - livestream
+    objectstorage:
+        extends:
+            file: docker-compose.base.yml
+            service: objectstorage
+
+        restart: on-failure
+        logging: *default-logging
+        # Override the well-known `object_storage_root_password` default from
+        # base.yml. MINIO_ROOT_USER stays as `object_storage_root_user` — only
+        # the password is parameterized.
+        environment:
+            MINIO_ROOT_PASSWORD: $OBJECT_STORAGE_PASSWORD
+        volumes:
+            - objectstorage:/data
+        # Bind MinIO API + console to loopback only. Public access flows through
+        # Caddy at /posthog/* — direct exposure of these ports leaks list-bucket
+        # to anyone with the IP. Default base.yml credentials are well-known.
+        ports:
+            - '127.0.0.1:19000:19000'
+            - '127.0.0.1:19001:19001'
+
+    seaweedfs:
+        extends:
+            file: docker-compose.base.yml
+            service: seaweedfs
+        container_name: '${SEAWEEDFS_DOCKER_NAME:-seaweedfs-main}'
+        restart: on-failure
+        logging: *default-logging
+        ports:
+            - '127.0.0.1:8333:8333' # S3 API
+            - '127.0.0.1:9333:9333' # Master server
+        volumes:
+            - seaweedfs:/data
+        healthcheck:
+            test:
+                [
+                    'CMD',
+                    'sh',
+                    '-c',
+                    "echo 's3.bucket.list' | /usr/bin/weed shell -master=localhost:9333 2>&1 | grep -q posthog",
+                ]
+            interval: 5s
+            timeout: 10s
+            retries: 30
+            start_period: 10s
+
+    asyncmigrationscheck:
+        image: posthog-app
+        build: .
+        extends:
+            file: docker-compose.base.yml
+            service: asyncmigrationscheck
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            # Doesn't actually touch MinIO, but inherits the default from
+            # dev-services.env via env_file. Override so leaked credentials
+            # don't appear in `docker compose config`.
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+            SKIP_ASYNC_MIGRATIONS_SETUP: 0
+
+    # Temporal containers
+    temporal:
+        extends:
+            file: docker-compose.base.yml
+            service: temporal
+        logging: *default-logging
+        # Temporal connects directly to Postgres for its own state (workflow
+        # history, task queues). Override POSTGRES_PWD from base.yml since base
+        # uses the `posthog`/`posthog` default. base.yml uses list-style env so
+        # this list override fully replaces it (compose merge semantics).
+        environment:
+            - ENABLE_ES=false
+            - POSTGRES_PWD=${POSTHOG_DB_PASSWORD}
+        # Bind gRPC API to loopback only. Temporal has NO auth in this config;
+        # any client with the host IP could `tctl` workflow-history dumps,
+        # cancel running workflows, or start new ones. Internal services reach
+        # it via docker DNS (`temporal:7233`) — host port only needed for
+        # SSH-tunneled debugging (`ssh -L 7233:127.0.0.1:7233 vps`).
+        ports:
+            - '127.0.0.1:7233:7233'
+        volumes:
+            - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+    elasticsearch:
+        extends:
+            file: docker-compose.base.yml
+            service: elasticsearch
+        logging: *default-logging
+    temporal-admin-tools:
+        extends:
+            file: docker-compose.base.yml
+            service: temporal-admin-tools
+        logging: *default-logging
+        depends_on:
+            - temporal
+    temporal-ui:
+        extends:
+            file: docker-compose.base.yml
+            service: temporal-ui
+        logging: *default-logging
+        # Loopback only — same reasoning as temporal:7233. The UI displays
+        # full workflow inputs/outputs (which contain application data) and
+        # has no auth. Tunnel via `ssh -L 8081:127.0.0.1:8081 vps` to debug.
+        ports:
+            - '127.0.0.1:8081:8080'
+        depends_on:
+            temporal:
+                condition: service_started
+            db:
+                condition: service_healthy
+    temporal-django-worker:
+        <<: *restart-prod
+        image: posthog-app
+        build: .
+        command: /compose/temporal-django-worker
+        extends:
+            file: docker-compose.base.yml
+            service: temporal-django-worker
+        logging: *default-logging
+        volumes:
+            - ./compose:/compose
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+            - seaweedfs
+            - temporal
+
+    cyclotron-janitor:
+        <<: *restart-prod
+        image: posthog-cyclotron-janitor
+        extends:
+            file: docker-compose.base.yml
+            service: cyclotron-janitor
+        build:
+            context: ./rust
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            KAFKA_HOSTS: 'kafka:9092'
+        depends_on:
+            db:
+                condition: service_healthy
+            kafka:
+                condition: service_started
+
+    capture:
+        <<: *restart-prod
+        image: posthog-capture
+        build:
+            context: ./rust
+        extends:
+            file: docker-compose.base.yml
+            service: capture
+        logging: *default-logging
+
+    replay-capture:
+        <<: *restart-prod
+        image: posthog-replay-capture
+        build:
+            context: ./rust
+        extends:
+            file: docker-compose.base.yml
+            service: replay-capture
+        logging: *default-logging
+
+    property-defs-rs:
+        <<: *restart-prod
+        image: posthog-property-defs-rs
+        build:
+            context: ./rust
+        extends:
+            file: docker-compose.base.yml
+            service: property-defs-rs
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+        depends_on:
+            kafka-init:
+                condition: service_completed_successfully
+            db:
+                condition: service_healthy
+
+    livestream:
+        <<: *restart-prod
+        image: posthog-livestream
+        build:
+            context: ./livestream
+        extends:
+            file: docker-compose.base.yml
+            service: livestream
+        logging: *default-logging
+        environment:
+            - LIVESTREAM_JWT_SECRET=${POSTHOG_SECRET}
+        volumes:
+            - ./docker/livestream/configs-hobby.yml:/configs/configs.yml
+
+    feature-flags:
+        <<: *restart-prod
+        image: posthog-feature-flags
+        build:
+            context: ./rust
+        extends:
+            file: docker-compose.base.yml
+            service: feature-flags
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+        depends_on:
+            - db
+            - redis7
+
+    hypercache-server:
+        <<: *restart-prod
+        image: posthog-hypercache-server
+        build:
+            context: ./rust
+        extends:
+            file: docker-compose.base.yml
+            service: hypercache-server
+        logging: *default-logging
+        depends_on:
+            - redis7
+
+    kafka-init:
+        image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+        entrypoint: /bin/sh
+        logging: *default-logging
+        environment:
+            # Sourced from .env. Defaults match a 1h / 128MB conservative profile.
+            KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-3600000}
+            KAFKA_LOG_SEGMENT_SIZE: ${KAFKA_LOG_SEGMENT_SIZE:-134217728}
+        command:
+            - -c
+            - |
+                set -x
+                echo "Waiting for Kafka broker to accept connections..."
+                TIMEOUT=60
+                ELAPSED=0
+                # Use rpk topic list as the readiness check - it's a simple operation
+                # that confirms the broker is accepting Kafka protocol requests
+                until rpk topic list --brokers kafka:9092 2>/dev/null; do
+                    echo "Kafka broker not ready yet (elapsed: ${ELAPSED}s)..."
+                    sleep 2
+                    ELAPSED=$((ELAPSED + 2))
+                    if [ $ELAPSED -ge $TIMEOUT ]; then
+                        echo "Timeout waiting for Kafka broker after ${TIMEOUT}s"
+                        echo "Final attempt to list topics:"
+                        rpk topic list --brokers kafka:9092 || true
+                        exit 1
+                    fi
+                done
+
+                # Apply cluster-level retention BEFORE topics are created so
+                # auto-created topics inherit these defaults. base.yml's
+                # `--mode dev-container` silently ignores broker env vars
+                # like KAFKA_LOG_RETENTION_HOURS — cluster config still works.
+                echo "Setting cluster-level retention (ms=$$KAFKA_LOG_RETENTION_MS, segment=$$KAFKA_LOG_SEGMENT_SIZE)..."
+                rpk cluster config set log_retention_ms "$$KAFKA_LOG_RETENTION_MS" --brokers kafka:9092 || true
+                rpk cluster config set log_segment_size "$$KAFKA_LOG_SEGMENT_SIZE" --brokers kafka:9092 || true
+                rpk cluster config set log_retention_check_interval_ms 60000 --brokers kafka:9092 || true
+
+                echo "Kafka broker is accepting requests, creating topics..."
+                # Create topics needed by rust services
+                # Note: $$ escapes $ for docker-compose variable substitution
+                for topic in clickhouse_events_json; do
+                    if rpk topic create "$$topic" --brokers kafka:9092 -p 1 -r 1 2>&1; then
+                        echo "Topic $$topic created successfully"
+                    else
+                        if rpk topic list --brokers kafka:9092 | grep -q "$$topic"; then
+                            echo "Topic $$topic already exists, continuing"
+                        else
+                            echo "Failed to create topic $$topic"
+                            exit 1
+                        fi
+                    fi
+                done
+
+                # Belt-and-suspenders: also enforce retention at TOPIC level on
+                # every existing topic. New topics still inherit cluster defaults.
+                echo "Applying topic-level retention to all existing topics..."
+                for topic in $$(rpk topic list --brokers kafka:9092 | tail -n +2 | awk '{print $$1}'); do
+                    rpk topic alter-config "$$topic" \
+                        --brokers kafka:9092 \
+                        --set "retention.ms=$$KAFKA_LOG_RETENTION_MS" \
+                        --set "segment.bytes=$$KAFKA_LOG_SEGMENT_SIZE" \
+                        || echo "Failed to alter $$topic, continuing"
+                done
+
+                echo "Final topic list:"
+                rpk topic list --brokers kafka:9092
+                echo "Topics ready"
+        depends_on:
+            kafka:
+                condition: service_healthy
+
+    cymbal:
+        <<: *restart-prod
+        image: posthog-cymbal
+        build:
+            context: ./rust
+            args:
+                BIN: cymbal
+        logging: *default-logging
+        volumes:
+            - ./share:/share
+        environment:
+            <<: *pg-env
+            KAFKA_HOSTS: 'kafka:9092'
+            OBJECT_STORAGE_BUCKET: posthog
+            # cymbal writes error-tracking blobs to SeaweedFS, not MinIO,
+            # and SeaweedFS S3 implementation accepts any creds (`any`/`any`).
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'any'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: 'any'
+            OBJECT_STORAGE_ENDPOINT: 'http://seaweedfs:8333'
+            OBJECT_STORAGE_FORCE_PATH_STYLE: 'true'
+            BIND_HOST: '0.0.0.0'
+            BIND_PORT: '3302'
+            MAXMIND_DB_PATH: '/share/GeoLite2-City.mmdb'
+            REDIS_URL: 'redis://redis7:6379/'
+            ISSUE_BUCKETS_REDIS_URL: 'redis://redis7:6379/'
+            RUST_LOG: 'info'
+        depends_on:
+            kafka-init:
+                condition: service_completed_successfully
+            seaweedfs:
+                condition: service_healthy
+            db:
+                condition: service_healthy
+            redis7:
+                condition: service_healthy
+
+volumes:
+    zookeeper-data:
+    zookeeper-datalog:
+    zookeeper-logs:
+    objectstorage:
+    seaweedfs:
+    postgres-data:
+    clickhouse-data:
+    caddy-data:
+    caddy-config:
+    redis7-data:
+    kafka-data:
+    redpanda-data:
