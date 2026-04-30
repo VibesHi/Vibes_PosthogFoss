@@ -67,8 +67,8 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
 x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
-x-mem-django:     &mem-django      { mem_limit: 1200m,  memswap_limit: 1500m }
-x-mem-django-sm:  &mem-django-sm   { mem_limit: 768m,   memswap_limit: 1g }
+x-mem-django:     &mem-django      { mem_limit: 2500m,  memswap_limit: 2500m }
+x-mem-django-sm:  &mem-django-sm   { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
 x-mem-node-hot:   &mem-node-hot    { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node-sm:    &mem-node-sm     { mem_limit: 384m,   memswap_limit: 512m }
