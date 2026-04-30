@@ -28,13 +28,18 @@ from django.apps import AppConfig
 # Upstream PostHog hides this bug because their hobby/cloud Docker images
 # are pre-built and pulled, never running collectstatic locally.
 #
-# Wrapped in try/except so any future upstream refactor that breaks this
-# preload doesn't take the whole `ee` app down with it; if the preload
-# fails the cycle will simply fire again at runtime, surfacing the issue.
+# Diagnostic mode: print the full traceback so we can see what's failing.
+# Once stable, replace the print/raise pair with a silent `pass`.
 try:
     import products.signals.backend.temporal  # noqa: F401
 except Exception:
-    pass
+    import sys
+    import traceback
+
+    sys.stderr.write("[ee.apps preload] signals.backend.temporal failed:\n")
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+    raise
 
 
 class EnterpriseConfig(AppConfig):
