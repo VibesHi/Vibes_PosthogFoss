@@ -9,6 +9,10 @@ model defined in ee/models/. Required because:
   - posthog/cloud_utils.py and posthog/utils.py import License and run
     `License.objects.filter(...)`. Without a backing table, those queries
     raise ProgrammingError. With this empty table, they return no rows.
+  - posthog/hogql_queries/ai/suggested_questions_query_runner.py is
+    registered in the OSS query runner registry and queries `CoreMemory`.
+    Without a backing table, the call raises ProgrammingError instead of
+    the expected DoesNotExist, which the runner can't recover from.
 
 Existing PostHog deployments (with the *real* upstream ee_role, ee_license,
 etc. tables already populated):
@@ -139,5 +143,33 @@ class Migration(migrations.Migration):
             name="TeamSessionSummariesConfig",
             fields=[("id", models.BigAutoField(primary_key=True, serialize=False))],
             options={"db_table": "ee_teamsessionsummariesconfig"},
+        ),
+        # CoreMemory is reachable from OSS code: SuggestedQuestionsQueryRunner
+        # (registered in posthog/hogql_queries/query_runner.py) does
+        # `CoreMemory.objects.get(team=...)` and the `except CoreMemory.DoesNotExist`
+        # there does NOT catch `ProgrammingError: relation does not exist`. So we
+        # need a real (empty) table — empty rows make `core_memory` return None,
+        # which the runner handles gracefully.
+        migrations.CreateModel(
+            name="CoreMemory",
+            fields=[
+                ("id", models.BigAutoField(primary_key=True, serialize=False)),
+                ("team_id", models.IntegerField(null=True, db_index=True)),
+                ("text", models.TextField(blank=True, default="")),
+                ("formatted_text", models.TextField(blank=True, default="")),
+            ],
+            options={"db_table": "ee_corememory"},
+        ),
+        # Hook is only touched by `manage.py migrate_hooks` (one-shot command).
+        # Adding the table preemptively so the command doesn't crash if invoked.
+        migrations.CreateModel(
+            name="Hook",
+            fields=[
+                ("id", models.BigAutoField(primary_key=True, serialize=False)),
+                ("team_id", models.IntegerField(null=True, db_index=True)),
+                ("event", models.CharField(max_length=200, null=True)),
+                ("target", models.URLField(blank=True, null=True)),
+            ],
+            options={"db_table": "ee_hook"},
         ),
     ]
