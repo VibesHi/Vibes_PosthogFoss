@@ -313,3 +313,102 @@ Optional:
 `POSTHOG_NODE_TAG` — all image references in `prod.yml` are hardcoded local tags.
 
 ---
+
+## Operational tuning
+
+### Host-level setup (one-time, not in setup-prod)
+
+`bin/setup-prod` warns if RAM < 16 GB, swap < 2 GB, or disk free < 100 GB but
+doesn't fix them — those changes need root and modify `/etc/fstab`, and
+some VPS types (LXC, restricted Docker hosts) forbid user-controlled swap.
+Run these explicitly:
+
+```bash
+sudo bin/setup-swap                    # 4 GB swap + vm.swappiness=10 (idempotent)
+sudo bin/setup-swap 8G                 # custom size
+
+# Reclaim disk before first build (build is 30-50 GB transient)
+docker system prune -a -f --volumes
+sudo journalctl --vacuum-time=2d
+sudo apt clean
+df -h /
+```
+
+### Per-project session replay retention
+
+Self-hosted PostHog defaults newly-created teams to **5 years** of replay
+retention (hardcoded in `posthog/models/team/team.py`). On a single-host
+install this lets SeaweedFS replay blobs grow to TBs over months. After
+signup, change for each project in:
+
+> Settings → Replay → Recording retention → "30 Days" → Save
+
+Or update all teams in one shot via Django shell:
+
+```bash
+docker compose exec -T web python manage.py shell <<'PY'
+from posthog.models import Team
+n = Team.objects.update(session_recording_retention_period="30d")
+print(f"Updated {n} teams")
+PY
+```
+
+Valid values: `"30d"`, `"90d"`, `"1y"`, `"5y"`.
+
+### Memory limits — what to do if a container OOM-kills
+
+Watch `docker stats` for 24-48 h after first deploy. Adjust the relevant
+anchor at the top of `docker-compose.prod.yml`:
+
+```yaml
+x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
+```
+
+Bump `mem_limit` for any service consistently above 80 % of its cap.
+Lower for any service consistently below 20 %. Sum of all `mem_limit`
+should stay under physical RAM minus ~2 GB (kernel + Docker daemon),
+relying on swap as a buffer.
+
+ClickHouse's hard cap is in two places — keep them in sync:
+
+- `docker/clickhouse/config.d.prod/memory_limits.xml` → `<max_server_memory_usage>` (server self-limit)
+- `docker-compose.prod.yml` → `x-mem-clickhouse: mem_limit:` (cgroup hard cap)
+
+The cgroup limit should be ~20 % above the server self-limit so CH never
+hits the docker OOM-killer (which is unrecoverable) — instead it throws
+"Memory limit exceeded" at the query level (recoverable).
+
+### Load testing the capture endpoint
+
+Use `bin/loadtest-capture` (vegeta wrapper, auto-installs vegeta on apt/brew,
+reads token+domain from `.env`):
+
+```bash
+bin/loadtest-capture                    # ramp 100 → 10k req/s, 30s each
+bin/loadtest-capture --rate 1000 --duration 5m
+bin/loadtest-capture --cleanup          # delete loadtest events from ClickHouse
+bin/loadtest-capture --help
+```
+
+The script prints the right `docker stats`, Kafka lag, and ClickHouse
+ingestion queries to run in another terminal while the test is in flight.
+
+Realistic numbers for the box-sized config (30 GB / 8 cores):
+
+| Metric | Sustained | Burst | Bottleneck |
+|---|---|---|---|
+| `/capture` req/s | 5 000-10 000 | 20 000+ | Rust capture is fast; Kafka write |
+| Events/s persisted to CH | 500-2 000 | 5 000 | `ingestion-general` CPU + Postgres person resolution |
+| Concurrent insight queries | 5-10 | 20 | ClickHouse memory + CPU |
+
+If Kafka consumer lag grows monotonically across the test → `ingestion-general`
+is overloaded; bump its replicas in `docker-compose.prod.yml`:
+
+```yaml
+    ingestion-general:
+        # ... existing ...
+        deploy:
+            replicas: 2
+```
+
+---

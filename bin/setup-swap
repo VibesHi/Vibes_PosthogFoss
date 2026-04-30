@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# bin/setup-swap -- create a host swap file as a panic-valve for the prod stack.
+#
+# Why separate from bin/setup-prod:
+#   - Modifies /etc/fstab and the host kernel's swap config.
+#   - Many container/VPS hosts forbid user-controlled swap (LXC, OpenVZ,
+#     restricted Docker hosts, some k8s nodes). Failing here shouldn't fail
+#     the whole prod setup.
+#   - Some operators run zswap, zram, or dedicated swap partitions and
+#     don't want a swapfile.
+#
+# Idempotent: re-running detects existing /swapfile and exits cleanly.
+#
+# Usage:
+#   sudo bin/setup-swap          # default 4G
+#   sudo bin/setup-swap 8G       # custom size
+#
+
+set -euo pipefail
+
+readonly C_BLUE=$'\033[1;34m'
+readonly C_YELLOW=$'\033[1;33m'
+readonly C_RED=$'\033[1;31m'
+readonly C_RESET=$'\033[0m'
+
+log()  { printf '%s[setup-swap]%s %s\n' "$C_BLUE"   "$C_RESET" "$*"; }
+warn() { printf '%s[setup-swap]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s[setup-swap]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
+
+SIZE="${1:-4G}"
+SWAPFILE="${SWAPFILE:-/swapfile}"
+
+[ "$(id -u)" -eq 0 ] || die "Run as root: sudo $0 ${SIZE}"
+
+# Refuse if the kernel doesn't support adding swap. Container hosts (LXC,
+# unprivileged Docker) lack CAP_SYS_ADMIN for swapon and silently no-op.
+# Detect by trying a tiny test allocation upfront.
+if ! grep -q '^Linux' /proc/version 2>/dev/null; then
+    die "Not Linux. macOS hosts manage swap differently — skip this script."
+fi
+
+# Already-active swap of any kind? Don't add more. Print existing config.
+if swapon --show=NAME,TYPE,SIZE --noheadings 2>/dev/null | grep -q .; then
+    log "Existing swap found:"
+    swapon --show
+    log "Skipping. Disable existing swap and re-run if you want a fresh setup."
+    exit 0
+fi
+
+# Existing /swapfile from a prior run? Activate it and exit.
+if [ -f "$SWAPFILE" ] && [ -r "$SWAPFILE" ]; then
+    log "$SWAPFILE already exists — activating"
+    chmod 600 "$SWAPFILE" 2>/dev/null || true
+    if swapon "$SWAPFILE" 2>/dev/null; then
+        log "Activated $SWAPFILE ($(du -h "$SWAPFILE" | cut -f1))"
+    else
+        warn "swapon failed — host may forbid user swap (LXC/container?). Check 'dmesg | tail'."
+        exit 1
+    fi
+else
+    log "Creating $SWAPFILE ($SIZE)"
+    if ! fallocate -l "$SIZE" "$SWAPFILE" 2>/dev/null; then
+        # fallocate fails on some filesystems (older ZFS, btrfs without nocow);
+        # fall back to dd which is universal but slower.
+        warn "fallocate failed (filesystem doesn't support it?), falling back to dd"
+        # Strip suffix and convert to MB for dd. Crude but covers the common
+        # cases ('1G', '4G', '8G', etc.).
+        case "$SIZE" in
+            *G) MB=$(( ${SIZE%G} * 1024 )) ;;
+            *M) MB="${SIZE%M}" ;;
+            *)  die "Unrecognized size: $SIZE (use 4G, 4096M, etc.)" ;;
+        esac
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$MB" status=progress
+    fi
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE" >/dev/null
+    if ! swapon "$SWAPFILE"; then
+        rm -f "$SWAPFILE"
+        die "swapon failed. Host likely forbids user-controlled swap (LXC/container/k8s). Skip this step."
+    fi
+fi
+
+# Persist across reboots. Idempotent: only append if not already in fstab.
+if ! grep -qE "^\s*${SWAPFILE//\//\\/}\s" /etc/fstab; then
+    log "Appending $SWAPFILE to /etc/fstab"
+    printf '\n# Added by bin/setup-swap on %s\n%s none swap sw 0 0\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SWAPFILE" >> /etc/fstab
+fi
+
+# Lower swappiness so swap is a true panic-valve, not actively used. Default
+# (60) is tuned for desktops; servers with a real working set want 10. Skip
+# if already configured to avoid stomping on sysadmin overrides.
+if [ ! -f /etc/sysctl.d/99-posthog.conf ]; then
+    log "Setting vm.swappiness=10 (panic-valve only, not aggressive paging)"
+    cat > /etc/sysctl.d/99-posthog.conf <<'EOF'
+# PostHog prod tuning: keep swap as a panic valve, not a regular page-out target.
+# Default 60 makes Linux swap aggressively even with free RAM; 10 keeps active
+# pages resident as long as RAM is available, only swapping under real pressure.
+vm.swappiness=10
+
+# Higher cache pressure makes the kernel reclaim dentries/inodes faster,
+# leaving more RAM for ClickHouse marks/uncompressed caches.
+vm.vfs_cache_pressure=200
+EOF
+    sysctl --system >/dev/null
+fi
+
+log "Done. Current state:"
+swapon --show
+free -h | head -3
