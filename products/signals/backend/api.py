@@ -18,9 +18,24 @@ from posthog.sync import database_sync_to_async
 from posthog.temporal.common.client import async_connect
 
 from products.signals.backend.models import SignalSourceConfig
-from products.signals.backend.temporal.buffer import BufferSignalsWorkflow
-from products.signals.backend.temporal.emitter import SignalEmitterInput, SignalEmitterWorkflow
-from products.signals.backend.temporal.types import BufferSignalsInput, EmitSignalInputs
+
+# NOTE: temporal.buffer / temporal.emitter / temporal.types imports were
+# previously here at module top. They are intentionally moved inside
+# `emit_signal` below to avoid a circular import. The cycle is:
+#
+#   posthog/api/__init__.py:30 → signals/views.py:51 → signals/api.py
+#     (this module) → signals/temporal/buffer.py:19 → temporal/grouping_v2
+#     → temporal/grouping.py:25 → posthog.api.embedding_worker
+#     → posthog/api/__init__.py (mid-load) → views.py:51
+#     → from signals.api import emit_signal  ← signals.api is mid-load,
+#       emit_signal not yet defined → ImportError
+#
+# Sibling files in this directory already use the lazy pattern for the
+# same reason (backfill_error_tracking.py:91, emit_eval_signal.py:146);
+# this file was the odd one out and tripped the cycle on `manage.py
+# collectstatic` in local Docker builds. Keeping the temporal imports
+# inside the function body matches that convention and breaks all known
+# entry points into the cycle.
 
 logger = structlog.get_logger(__name__)
 
@@ -88,6 +103,10 @@ async def emit_signal(
             extra={"html_url": "https://github.com/posthog/posthog/issues/12345", "number": 12345, ...},
         )
     """
+    # See module-top NOTE: these imports are lazy to break a circular import.
+    from products.signals.backend.temporal.buffer import BufferSignalsWorkflow
+    from products.signals.backend.temporal.emitter import SignalEmitterInput, SignalEmitterWorkflow
+    from products.signals.backend.temporal.types import BufferSignalsInput, EmitSignalInputs
 
     organization = await database_sync_to_async(lambda: team.organization)()
     if not organization.is_ai_data_processing_approved:
