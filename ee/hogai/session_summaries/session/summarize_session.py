@@ -35,3 +35,24 @@ async def execute_summarize_session_video_stream(*args, **kwargs):
     """Async generator stub. Never iterated on FOSS."""
     if False:
         yield  # pragma: no cover
+
+
+@dataclass
+class SessionSummaryDBData:
+    session_id: str = ""
+    events: list[Any] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def get_session_data_from_db(*args, **kwargs) -> SessionSummaryDBData:
+    """Upstream pulls events + metadata from posthog DB + ClickHouse. FOSS: empty."""
+    return SessionSummaryDBData()
+
+
+def prepare_data_for_single_session_summary(*args, **kwargs) -> Any:
+    """Upstream filters/groups raw events into the LLM-ready shape. FOSS: empty."""
+    return SessionSummaryDBData()
+
+
+def prepare_single_session_summary_input(*args, **kwargs) -> SingleSessionSummaryLlmInputs:
+    return SingleSessionSummaryLlmInputs()

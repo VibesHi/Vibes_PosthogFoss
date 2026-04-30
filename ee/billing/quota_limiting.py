@@ -67,3 +67,9 @@ update_all_orgs_billing_quotas.delay = lambda *a, **kw: None  # type: ignore[att
 def is_team_limited(*args, **kwargs) -> bool:
     """Returns True if the team is currently over a quota. FOSS: never."""
     return False
+
+
+def update_organization_usage_fields(*args, **kwargs) -> None:
+    """Upstream syncs cached usage_<resource> fields on the Organization model
+    from the billing service. FOSS: no billing service, no-op."""
+    return None

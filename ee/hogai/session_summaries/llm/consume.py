@@ -17,3 +17,15 @@ def get_llm_session_group_summary(*args, **kwargs) -> Any:
 
 def consume_llm_pattern_response(*args, **kwargs) -> Any:
     return None
+
+
+def get_llm_session_group_patterns_extraction(*args, **kwargs) -> Any:
+    return None
+
+
+def get_llm_session_group_patterns_assignment(*args, **kwargs) -> Any:
+    return None
+
+
+def get_llm_session_group_patterns_combination(*args, **kwargs) -> Any:
+    return None

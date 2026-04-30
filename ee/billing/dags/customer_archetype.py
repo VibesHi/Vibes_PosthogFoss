@@ -18,3 +18,13 @@ def customer_archetype_job(*args, **kwargs) -> Any:
 
 def customer_archetype_to_clay(*args, **kwargs) -> Any:
     return None
+
+
+# posthog/dags/locations/billing.py imports these names at module top.
+# Real upstream defines them as Dagster JobDefinition / ScheduleDefinition /
+# AssetsDefinition objects. Self-host doesn't run Dagster, so None is fine --
+# Dagster's loader skips missing/None-typed entries instead of crashing.
+archetype_account_data: Any = None
+archetype_classify_and_sync: Any = None
+archetype_job: Any = None
+archetype_weekly_schedule: Any = None

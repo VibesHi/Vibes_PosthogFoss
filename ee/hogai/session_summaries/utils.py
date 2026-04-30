@@ -36,6 +36,12 @@ def parse_str_timestamp_to_s(*args, **kwargs) -> float:
     return 0.0
 
 
+def unpack_full_event_id(*args, **kwargs) -> tuple[str, str]:
+    """Upstream returns (session_id, event_id) from a packed identifier. FOSS:
+    return empty strings; the calling activity won't run on a FOSS deploy."""
+    return ("", "")
+
+
 # Generic catch-all; some files import names not enumerated above.
 def _stub(*args, **kwargs) -> Any:
     return None

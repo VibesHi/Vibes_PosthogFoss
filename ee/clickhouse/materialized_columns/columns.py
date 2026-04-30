@@ -49,3 +49,42 @@ class MaterializedColumnDetails:
 
     def __init__(self, *args, **kwargs):
         pass
+
+
+class MaterializedColumn:
+    """Upstream represents a single materialized column on a CH table. FOSS inert."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _IndexBase:
+    """Common stub for all materialized-column index variants.
+
+    Upstream these are dataclass-like configs handed to ALTER TABLE ADD INDEX.
+    On FOSS we never run ALTER, so any kwargs accepted is a no-op."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class BloomFilterIndex(_IndexBase):
+    pass
+
+
+class MinMaxIndex(_IndexBase):
+    pass
+
+
+class NgramLowerIndex(_IndexBase):
+    pass
+
+
+def check_index_exists(*args, **kwargs) -> bool:
+    """Upstream queries system.data_skipping_indices. FOSS: pretend nothing exists."""
+    return False
+
+
+# Upstream `tables` is a tuple of CH table names that support materialization.
+# Empty here so callers iterate over nothing and produce no ALTER statements.
+tables: tuple[str, ...] = ()

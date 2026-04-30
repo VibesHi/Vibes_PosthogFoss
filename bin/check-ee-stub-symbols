@@ -62,26 +62,45 @@ def collect_module_names(path: Path) -> set[str]:
     return names
 
 
-def grep_import_lines() -> list[tuple[str, str, str]]:
-    """Returns [(file, module_path, raw_imports_str)]."""
-    cmd = [
-        "grep", "-rEn", r"^[[:space:]]*from\s+ee\.",
-        "posthog", "products",
-        "--include=*.py", "--exclude-dir=tests", "--exclude-dir=test",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, check=False)
-    out: list[tuple[str, str, str]] = []
-    for raw in res.stdout.splitlines():
+def discover_ee_imports() -> list[tuple[str, str, str, list[str]]]:
+    """Walk posthog/ + products/ source files and AST-parse every
+    `from ee.X import a, b, c` (top-level OR nested inside functions /
+    try-blocks) into structured records.
+
+    AST-based so we correctly handle parenthesised multi-line imports like:
+
+        from ee.hogai.session_summaries.utils import (
+            calculate_time_since_start,
+            get_column_index,
+            unpack_full_event_id,
+        )
+
+    The previous grep-based implementation only saw the first physical line
+    and parsed an empty symbol list, silently missing every name in the
+    body of multi-line imports.
+
+    Returns [(file_relative, ee_module, line_number, [imported_names])].
+    """
+    out: list[tuple[str, str, str, list[str]]] = []
+    for src in list(ROOT.glob("posthog/**/*.py")) + list(ROOT.glob("products/**/*.py")):
+        rel = src.relative_to(ROOT)
+        # Mirror the bash scan's exclude rules.
+        if "test" in rel.parts or rel.name.startswith("test_") or rel.name == "conftest.py":
+            continue
         try:
-            file, _ln, line = raw.split(":", 2)
-        except ValueError:
+            tree = ast.parse(src.read_text(), filename=str(src))
+        except SyntaxError:
             continue
-        if "/test_" in file or file.endswith("conftest.py"):
-            continue
-        m = FROM_IMPORT_HEAD.match(line)
-        if not m:
-            continue
-        out.append((file, m.group(1), m.group(2).rstrip("\\").rstrip()))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if not node.module or not node.module.startswith("ee."):
+                continue
+            ee_mod = node.module[len("ee.") :]
+            names = [a.name for a in node.names if a.name != "*"]
+            if not names:
+                continue
+            out.append((str(rel), ee_mod, str(node.lineno), names))
     return out
 
 
@@ -228,16 +247,22 @@ def main() -> int:
     issues: list[str] = []
     cache: dict[Path, set[str]] = {}
     cls_cache: dict[Path, dict[str, set[str]]] = {}
-    # Pass 1: file + symbol existence (the original grep-derived check).
-    for file, mod, imports_str in grep_import_lines():
+    # Pass 1: file + symbol existence via AST (correctly handles multi-line
+    # parenthesised `from ee.X import (a, b, c)` forms).
+    for file, mod, lineno, names in discover_ee_imports():
         path = resolve_module_file(mod)
         if path is None:
-            issues.append(f"{file}: missing FILE  ee/{mod.replace('.', '/')}{{.py,/__init__.py}}")
+            issues.append(
+                f"{file}:{lineno}: missing FILE  ee/{mod.replace('.', '/')}{{.py,/__init__.py}}"
+            )
             continue
-        names = cache.setdefault(path, collect_module_names(path))
-        for sym in parse_imported_names(imports_str):
-            if sym not in names:
-                issues.append(f"{file}: missing SYMBOL  ee.{mod}.{sym}  (add to {path.relative_to(ROOT)})")
+        defined = cache.setdefault(path, collect_module_names(path))
+        for sym in names:
+            if sym not in defined:
+                issues.append(
+                    f"{file}:{lineno}: missing SYMBOL  ee.{mod}.{sym}  "
+                    f"(add to {path.relative_to(ROOT)})"
+                )
     # Pass 2: module-level `Imported.X` attribute access. Catches the
     # `AssistantMode.ASSISTANT` class-body-default class of failure that
     # crashes Django boot before any function runs.
