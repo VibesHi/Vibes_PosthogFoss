@@ -387,15 +387,50 @@ phase_build() {
 # ============================================================================
 
 is_existing_install() {
-    # Hobby's heuristic: if Postgres OR ClickHouse named volumes exist, this
-    # is an upgrade and we MUST verify no async migrations are pending.
-    # Pending async migrations + new code = potential data corruption.
-    local project="${COMPOSE_PROJECT_NAME:-posthog}" vol
-    for vol in postgres-data clickhouse-data; do
-        if $SUDO docker volume ls --format '{{.Name}}' | grep -qE "^${project}_${vol}$"; then
-            return 0
+    # An "existing install" is one where Django migrations have run at least
+    # once. We can't just check for the postgres-data volume — a previous
+    # setup-prod that crashed before web could finish bin/migrate (e.g. kafka
+    # OOM, ClickHouse misconfig, etc.) leaves an empty PG data dir behind,
+    # and asyncmigrationscheck later dies with `UndefinedTable:
+    # posthog_asyncmigration` because Django boot calls setup_async_migrations()
+    # which queries that table during AppConfig.ready().
+    #
+    # Canonical marker: presence of `django_migrations` in the public schema.
+    # It's created by the very first `manage.py migrate` and never dropped.
+    local project="${COMPOSE_PROJECT_NAME:-posthog}"
+
+    $SUDO docker volume ls --format '{{.Name}}' \
+        | grep -qE "^${project}_postgres-data$" || return 1
+
+    # Volume exists. Bring up just db so we can query it. Idempotent — no-op
+    # if it's already running. db has no depends_on, so this won't cascade
+    # into starting the rest of the stack.
+    dc up -d db >/dev/null 2>&1 || {
+        warn "Couldn't start db to verify migration state — treating as fresh install."
+        return 1
+    }
+
+    # Wait up to 60s for PG to accept connections. Warm volumes start in <10s.
+    local elapsed=0
+    until dc exec -T db pg_isready -U posthog -d posthog >/dev/null 2>&1; do
+        sleep 2
+        elapsed=$((elapsed + 2))
+        if [ "$elapsed" -ge 60 ]; then
+            warn "db didn't accept connections in 60s — treating as fresh install."
+            return 1
         fi
     done
+
+    if dc exec -T db psql -U posthog -d posthog -tAc \
+        "SELECT 1 FROM information_schema.tables \
+         WHERE table_schema='public' AND table_name='django_migrations'" \
+        2>/dev/null | grep -q '^1$'; then
+        return 0
+    fi
+
+    warn "Postgres volume exists but django_migrations table is missing —"
+    warn "previous install likely crashed before web ran bin/migrate."
+    warn "Treating as fresh install; web will run migrations on next start."
     return 1
 }
 
