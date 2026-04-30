@@ -353,7 +353,15 @@ services:
             OTEL_EXPORTER_OTLP_ENDPOINT: ''
             OTEL_SDK_DISABLED: 'true'
             OPT_OUT_CAPTURE: ${OPT_OUT_CAPTURE:-false}
-            DEPLOYMENT: 'hobby'
+            DEPLOYMENT: 'vibes-foss'
+            # Bypass the upstream nginx-unit docker-entrypoint.sh, which checks
+            # `[ ! -z "$(ls -A /var/lib/unit/)" ]` and skips loading config when
+            # /var/lib/unit has any contents. Unit creates `certs/` and `scripts/`
+            # subdirs eagerly on startup, so that check ALWAYS trips → empty
+            # config → no listener on :8000 → Caddy gets connection refused.
+            # Pre-baking config into a temp statedir avoids the broken check
+            # entirely. Bonus: skips a Unit double-start, halving boot time.
+            NGINX_UNIT_PRELOAD_CONFIG: 'true'
         depends_on:
             - db
             - redis7
