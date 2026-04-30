@@ -115,9 +115,120 @@ def resolve_module_file(mod: str) -> Path | None:
     return None
 
 
+def collect_class_attrs(path: Path) -> dict[str, set[str]]:
+    """For each top-level class in `path`, return the set of class-attribute
+    names defined directly in its body (not inherited).
+
+    Used to verify `EnumName.MEMBER` references at IMPORT time in OSS code.
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return {}
+    out: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        attrs: set[str] = set()
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        attrs.add(tgt.id)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                attrs.add(stmt.target.id)
+            elif isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                attrs.add(stmt.name)
+        # Track whether a permissive metaclass is in play (PermissiveConstants
+        # base or _PermissiveConstantsMeta metaclass) -- accept any attribute.
+        bases = [ast.unparse(b) for b in node.bases]
+        meta_kw = next((k for k in node.keywords if k.arg == "metaclass"), None)
+        meta_name = ast.unparse(meta_kw.value) if meta_kw else ""
+        if any("PermissiveConstants" in b for b in bases) or "PermissiveConstants" in meta_name:
+            attrs.add("__permissive__")
+        out[node.name] = attrs
+    return out
+
+
+def find_module_level_attr_access(path: Path, imports: dict[str, tuple[str, str]]) -> list[tuple[str, str, str]]:
+    """Walks `path`'s module-level statements (not function bodies) looking for
+    `Imported.X` attribute access where `Imported` was imported from `ee.*`.
+
+    Returns [(file, ee_module, attr)].
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return []
+    found: list[tuple[str, str, str]] = []
+
+    def is_module_level(stmt) -> bool:
+        # We want class body, dataclass field defaults, decorators, top-level
+        # assignments. Function bodies are NOT module-level (they fire at call
+        # time, not import time).
+        return True
+
+    def walk(node: ast.AST):
+        for child in ast.walk(node):
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                base = child.value.id
+                if base in imports:
+                    found.append((str(path), imports[base][0], child.attr))
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+            # Inspect decorators + default arg values, but not the body itself.
+            for d in stmt.decorator_list:
+                walk(d)
+            for default in stmt.args.defaults + stmt.args.kw_defaults:
+                if default is not None:
+                    walk(default)
+            continue
+        if isinstance(stmt, ast.ClassDef):
+            # Decorators, base list, and class-body statements that aren't
+            # method definitions all evaluate at class-creation time.
+            for d in stmt.decorator_list:
+                walk(d)
+            for b in stmt.bases:
+                walk(b)
+            for body_stmt in stmt.body:
+                if isinstance(body_stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                    for d in body_stmt.decorator_list:
+                        walk(d)
+                    for default in body_stmt.args.defaults + body_stmt.args.kw_defaults:
+                        if default is not None:
+                            walk(default)
+                else:
+                    walk(body_stmt)
+            continue
+        walk(stmt)
+    return found
+
+
+def collect_imports(path: Path) -> dict[str, tuple[str, str]]:
+    """`{local_name: (ee_module, original_name)}` for `from ee.X import Y [as Z]` lines."""
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if not node.module or not node.module.startswith("ee."):
+            continue
+        ee_mod = node.module[len("ee.") :]
+        for a in node.names:
+            local = a.asname or a.name
+            out[local] = (ee_mod, a.name)
+    return out
+
+
 def main() -> int:
     issues: list[str] = []
     cache: dict[Path, set[str]] = {}
+    cls_cache: dict[Path, dict[str, set[str]]] = {}
+    # Pass 1: file + symbol existence (the original grep-derived check).
     for file, mod, imports_str in grep_import_lines():
         path = resolve_module_file(mod)
         if path is None:
@@ -127,6 +238,56 @@ def main() -> int:
         for sym in parse_imported_names(imports_str):
             if sym not in names:
                 issues.append(f"{file}: missing SYMBOL  ee.{mod}.{sym}  (add to {path.relative_to(ROOT)})")
+    # Pass 2: module-level `Imported.X` attribute access. Catches the
+    # `AssistantMode.ASSISTANT` class-body-default class of failure that
+    # crashes Django boot before any function runs.
+    for src in list(ROOT.glob("posthog/**/*.py")) + list(ROOT.glob("products/**/*.py")):
+        rel = src.relative_to(ROOT)
+        if "test" in rel.parts or rel.name.startswith("test_") or rel.name == "conftest.py":
+            continue
+        imports = collect_imports(src)
+        if not imports:
+            continue
+        for _f, ee_mod, attr in find_module_level_attr_access(src, imports):
+            ee_path = resolve_module_file(ee_mod)
+            if ee_path is None:
+                continue  # already flagged in pass 1
+            # We need to look up the LOCALLY-IMPORTED NAME on the ee module's
+            # class. If `from ee.X import Foo`, and code does `Foo.BAR`, find
+            # the class `Foo` in ee/X.py and check it has BAR.
+            local_name_to_orig = {loc: orig for loc, (mod, orig) in imports.items() if mod == ee_mod}
+            # imports dict keys are local names; we got `attr` via base.id matching local name.
+            # Find which local name was the base. Easier: re-walk.
+            pass  # (fall through; specific checks below)
+        # Per-class member check.
+        for base_local, (ee_mod, ee_orig) in imports.items():
+            ee_path = resolve_module_file(ee_mod)
+            if ee_path is None:
+                continue
+            class_attrs = cls_cache.setdefault(ee_path, collect_class_attrs(ee_path))
+            target_attrs = class_attrs.get(ee_orig)
+            if target_attrs is None:
+                continue
+            if "__permissive__" in target_attrs:
+                continue
+            # Skip attributes Django auto-injects on model classes / managers,
+            # and DRF auto-exposes on serializers/viewsets.
+            DJANGO_AUTO = {
+                "objects", "_meta", "_default_manager", "_base_manager",
+                "DoesNotExist", "MultipleObjectsReturned", "pk", "id",
+                "Meta", "save", "delete",
+            }
+            for _f, _mod, attr in find_module_level_attr_access(src, {base_local: (ee_mod, ee_orig)}):
+                if attr.startswith("_"):
+                    continue
+                if attr in target_attrs:
+                    continue
+                if attr in DJANGO_AUTO:
+                    continue
+                issues.append(
+                    f"{rel}: missing MEMBER  ee.{ee_mod}.{ee_orig}.{attr}  "
+                    f"(add to {ee_path.relative_to(ROOT)} or inherit from PermissiveConstants)"
+                )
     if issues:
         print("EE stub symbol coverage gaps:")
         for s in sorted(set(issues)):

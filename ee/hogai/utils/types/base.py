@@ -1,27 +1,34 @@
 """FOSS stub for ee.hogai.utils.types.base."""
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
+from ee._stubs import PermissiveConstants
 
-class AssistantGraphName(str, Enum):
-    """Identifiers for the different agent loop graphs upstream registers."""
+
+class AssistantGraphName(PermissiveConstants):
+    """Identifiers for the different agent loop graphs upstream registers.
+    Permissive: any `.X` access returns "x"."""
 
     DEFAULT = "default"
     RESEARCH = "research"
     CHAT = "chat"
+    SUPPORT = "support"
 
 
-class AssistantNodeName(str, Enum):
-    """Identifiers for graph nodes used in products/*/backend/max_tools.py.
-    Upstream covers ~30 nodes; FOSS only needs the names to be importable."""
+class AssistantNodeName(PermissiveConstants):
+    """Identifiers for graph nodes. Upstream has ~30 specific values;
+    permissive metaclass handles drift without explicit listing."""
 
     START = "start"
     END = "end"
+    ROOT = "root"
+    ROOT_TOOLS = "root_tools"
     TOOLS = "tools"
     AGENT = "agent"
     HUMAN = "human"
+    WEB_ANALYTICS_FILTER = "web_analytics_filter"
+    WEB_ANALYTICS_FILTER_OPTIONS_TOOLS = "web_analytics_filter_options_tools"
 
 
 @dataclass

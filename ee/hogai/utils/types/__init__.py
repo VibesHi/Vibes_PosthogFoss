@@ -1,8 +1,9 @@
 """FOSS stub for ee.hogai.utils.types."""
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
+
+from ee._stubs import PermissiveConstants
 
 
 @dataclass
@@ -29,9 +30,11 @@ class AssistantOutput:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-class AssistantMode(str, Enum):
-    """Upstream switches the agent loop on this. FOSS: defined, never compared against."""
+class AssistantMode(PermissiveConstants):
+    """Upstream switches the agent loop on this. Permissive: `AssistantMode.X`
+    returns "x" for any X. Explicit members below for the values we know about."""
 
+    ASSISTANT = "assistant"
     DEFAULT = "default"
     RESEARCH = "research"
     CHAT = "chat"

@@ -122,3 +122,37 @@ class StubManager:
 def stub_function(*args, **kwargs) -> None:
     """Generic no-op for stubbed functions. Returns None."""
     return None
+
+
+class _PermissiveConstantsMeta(type):
+    """Metaclass that returns a string sentinel for any missing class attr.
+
+    Real upstream has these as `Enum` subclasses with a fixed set of members
+    (e.g. AssistantMode.ASSISTANT, AssistantNodeName.ROOT). On FOSS we don't
+    know the full member set without diffing upstream, AND it churns. So:
+
+      class AssistantMode(metaclass=_PermissiveConstantsMeta):
+          ASSISTANT = "assistant"  # explicit when we know the member
+
+    Then:
+      - `AssistantMode.ASSISTANT` → "assistant"  (explicit class attr wins)
+      - `AssistantMode.WHATEVER`  → "whatever"   (metaclass __getattr__)
+
+    `__getattr__` only fires when normal attribute lookup fails, so explicit
+    class attributes are returned as-is. The fallback covers upstream-drift.
+
+    Equality (`mode == AssistantMode.ASSISTANT`) is plain string comparison.
+    Iteration (`for m in AssistantMode`) does NOT work — add explicit members
+    or convert to a real Enum if you hit that path.
+    """
+
+    def __getattr__(cls, name: str) -> str:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return name.lower()
+
+
+class PermissiveConstants(metaclass=_PermissiveConstantsMeta):
+    """Inherit to get permissive `.SOME_NEW_MEMBER` access on FOSS stubs."""
+
+    pass
