@@ -242,6 +242,18 @@ phase_check_ee_stubs() {
     else
         log "ee/ stub coverage looks complete"
     fi
+
+    # File-existence pass above only catches missing FILES. The Django boot
+    # will still ImportError on missing SYMBOLS within an existing stub
+    # (e.g. `from ee.X.Y import Z` where ee/X/Y.py exists but doesn't define Z).
+    # bin/check-ee-stub-symbols does the AST-based symbol check; running it
+    # here surfaces those gaps before we burn 4+ minutes on a docker build
+    # that's going to crash at `manage.py collectstatic`.
+    if [ -x "bin/check-ee-stub-symbols" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 bin/check-ee-stub-symbols >&2; then
+            warn "Add the missing symbols and rerun. (continuing — runtime imports will fail)"
+        fi
+    fi
 }
 
 # ============================================================================

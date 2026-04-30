@@ -8,3 +8,7 @@ this branch is dead.
 class EnterpriseCohortQuery:
     def __init__(self, *args, **kwargs):
         raise NotImplementedError("EE cohort query unavailable in FOSS fork")
+
+
+# Some callers import the unaliased name directly.
+CohortQuery = EnterpriseCohortQuery

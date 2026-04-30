@@ -18,3 +18,7 @@ class ConversationRedisStream:
 
     async def publish(self, *args, **kwargs):
         return None
+
+
+def get_conversation_stream_key(conversation_id: str = "", *args, **kwargs) -> str:
+    return f"{CONVERSATION_STREAM_PREFIX}{conversation_id}"

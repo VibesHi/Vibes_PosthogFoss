@@ -54,3 +54,16 @@ def org_quota_limited_until(*args, **kwargs) -> Any:
 
 def update_org_billing_quotas(*args, **kwargs) -> None:
     return None
+
+
+def update_all_orgs_billing_quotas(*args, **kwargs) -> None:
+    """Upstream Celery/Temporal task that syncs billing service → Redis. FOSS: no billing."""
+    return None
+
+
+update_all_orgs_billing_quotas.delay = lambda *a, **kw: None  # type: ignore[attr-defined]
+
+
+def is_team_limited(*args, **kwargs) -> bool:
+    """Returns True if the team is currently over a quota. FOSS: never."""
+    return False

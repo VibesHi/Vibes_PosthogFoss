@@ -11,3 +11,10 @@ class MaxChatOpenAI:
 
     def __init__(self, *args, **kwargs):
         raise NotImplementedError("Max AI assistant unavailable in FOSS fork")
+
+
+class MaxChatAnthropic:
+    """Same pattern for the Anthropic path used by anomaly_investigation runner."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError("Max AI assistant unavailable in FOSS fork")

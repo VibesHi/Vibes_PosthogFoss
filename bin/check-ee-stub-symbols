@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Symbol-level coverage check for the FOSS ee/ stub package.
+
+The bash scan in bin/setup-prod only verifies that ee/X/Y.py *exists* for every
+`from ee.X.Y import Z` in production code. It can't tell whether Z is actually
+defined in the file. Django boot will then crash with ImportError at the first
+missing symbol, requiring a docker rebuild round-trip per fix.
+
+This script does the symbol-level check via AST without importing anything:
+
+  1. grep every `from ee.X.Y import a, b, c` line in posthog/ + products/
+  2. parse ee/X/Y.py with ast and collect top-level names
+     (def, class, =, import-as, dataclass-decorated etc.)
+  3. flag every (a, b, c) not present in the parsed names
+
+Run before each docker build:
+    bin/check-ee-stub-symbols
+
+Exit code 0 => all good. Exit code 1 => missing symbols, see output.
+"""
+from __future__ import annotations
+
+import ast
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EE = ROOT / "ee"
+
+# Match `from ee.X.Y import a, b as c, d` even with line continuations
+# (we slurp parenthesized multi-line forms post-grep with a small parser below).
+FROM_IMPORT_HEAD = re.compile(r"^\s*from\s+ee\.([A-Za-z0-9_.]+)\s+import\s+(.+?)\s*$")
+
+
+def collect_module_names(path: Path) -> set[str]:
+    """All top-level names defined in `path`. Empty set if file unparseable."""
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    names.add(tgt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                names.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == "*":
+                    continue
+                names.add(a.asname or a.name)
+    return names
+
+
+def grep_import_lines() -> list[tuple[str, str, str]]:
+    """Returns [(file, module_path, raw_imports_str)]."""
+    cmd = [
+        "grep", "-rEn", r"^[[:space:]]*from\s+ee\.",
+        "posthog", "products",
+        "--include=*.py", "--exclude-dir=tests", "--exclude-dir=test",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, check=False)
+    out: list[tuple[str, str, str]] = []
+    for raw in res.stdout.splitlines():
+        try:
+            file, _ln, line = raw.split(":", 2)
+        except ValueError:
+            continue
+        if "/test_" in file or file.endswith("conftest.py"):
+            continue
+        m = FROM_IMPORT_HEAD.match(line)
+        if not m:
+            continue
+        out.append((file, m.group(1), m.group(2).rstrip("\\").rstrip()))
+    return out
+
+
+def parse_imported_names(s: str) -> list[str]:
+    """`a, b as c, (d, e)` → ['a', 'c', 'd', 'e']."""
+    # Strip trailing inline comments like `# noqa: F403` so they don't show up
+    # as fake imports.
+    if "#" in s:
+        s = s.split("#", 1)[0]
+    s = s.strip().lstrip("(").rstrip(")")
+    out: list[str] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if " as " in part:
+            part = part.split(" as ", 1)[1].strip()
+        # Handle `name)` if grep cut a multi-line import mid-list
+        part = part.rstrip(")").strip()
+        if part.isidentifier():
+            out.append(part)
+    return out
+
+
+def resolve_module_file(mod: str) -> Path | None:
+    base = EE / mod.replace(".", "/")
+    if (base.with_suffix(".py")).is_file():
+        return base.with_suffix(".py")
+    if (base / "__init__.py").is_file():
+        return base / "__init__.py"
+    return None
+
+
+def main() -> int:
+    issues: list[str] = []
+    cache: dict[Path, set[str]] = {}
+    for file, mod, imports_str in grep_import_lines():
+        path = resolve_module_file(mod)
+        if path is None:
+            issues.append(f"{file}: missing FILE  ee/{mod.replace('.', '/')}{{.py,/__init__.py}}")
+            continue
+        names = cache.setdefault(path, collect_module_names(path))
+        for sym in parse_imported_names(imports_str):
+            if sym not in names:
+                issues.append(f"{file}: missing SYMBOL  ee.{mod}.{sym}  (add to {path.relative_to(ROOT)})")
+    if issues:
+        print("EE stub symbol coverage gaps:")
+        for s in sorted(set(issues)):
+            print(f"  {s}")
+        print(f"\n{len(set(issues))} issue(s). Add the missing symbols and rerun.")
+        return 1
+    print("ee/ stub symbol coverage looks complete")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

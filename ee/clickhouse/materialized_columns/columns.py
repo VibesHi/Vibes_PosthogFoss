@@ -38,3 +38,14 @@ def drop_materialized_column(*args, **kwargs) -> None:
 
 def update_column_is_disabled(*args, **kwargs) -> None:
     return None
+
+
+def drop_column(*args, **kwargs) -> None:
+    return None
+
+
+class MaterializedColumnDetails:
+    """Upstream describes a materialized column; FOSS instances are never created."""
+
+    def __init__(self, *args, **kwargs):
+        pass

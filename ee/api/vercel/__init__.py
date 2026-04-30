@@ -9,3 +9,5 @@ those registrations don't run, so the names just need to be import-resolvable.
 We expose four trivial submodules below via Python's normal import machinery
 (four sibling files in this directory).
 """
+
+from ee.api.vercel import vercel_installation, vercel_product, vercel_proxy, vercel_resource  # noqa: F401

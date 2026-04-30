@@ -21,3 +21,11 @@ def get_cached_signals(*args, **kwargs) -> Any:
 
 def set_cached_signals(*args, **kwargs) -> None:
     return None
+
+
+def get_cached_accounts_count(*args, **kwargs) -> int:
+    return 0
+
+
+def store_accounts_in_redis(*args, **kwargs) -> None:
+    return None

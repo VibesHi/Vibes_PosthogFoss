@@ -7,3 +7,10 @@ class SessionSummarySerializer(serializers.Serializer):
     """No-op DRF serializer. Never instantiated on FOSS."""
 
     pass
+
+
+class OutcomeSerializer(serializers.Serializer):
+    """Used by posthog/session_recordings/session_recording_api.py to validate
+    the LLM-generated session summary outcome payload before returning it."""
+
+    pass
