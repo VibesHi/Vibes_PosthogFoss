@@ -5,18 +5,23 @@ ClickHouse table and add a materialized column for a JSON property -- a
 significant query-performance optimization. FOSS: no auto-materialization;
 queries that filter on JSON properties stay slower (read JSON at query time).
 
-This stub keeps the module importable; CH migrations 0019 and 0026 wrap the
-import in try/except, so even if absent they're no-ops -- present-with-noop
-behaviour is the same. Same for posthog/clickhouse/materialized_columns.py
-which gates this behind `if EE_AVAILABLE:` (False on FOSS).
+CRITICAL: `materialize` is INTENTIONALLY NOT defined here. Production CH
+migrations `posthog/clickhouse/migrations/0019_*` and `0026_*` use
+`from ee.clickhouse.materialized_columns.columns import materialize` inside
+a `try/except ImportError: return` block as the canonical "skip on FOSS"
+guard. If we expose a no-op `materialize` here the import succeeds, the
+migration falls past the early return, and `ensure_only_new_column_exists`
+runs broken ALTER statements against `sharded_events` / `events` because
+`current_materialized_column` is always None on FOSS (gated by
+EE_AVAILABLE in posthog/clickhouse/materialized_columns.py). Letting the
+import fail is what those migrations are designed to handle.
+
+Test files and Dagster DAGs do `from ... import materialize` at module
+top and will ImportError -- but they're never loaded in production
+containers (no pytest, no dagster on FOSS).
 """
 
 from typing import Any
-
-
-def materialize(*args, **kwargs) -> None:
-    """No-op. Real upstream emits an ALTER TABLE ADD COLUMN MATERIALIZED."""
-    return None
 
 
 def get_enabled_materialized_columns(*args, **kwargs) -> dict:
