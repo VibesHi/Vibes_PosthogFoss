@@ -38,13 +38,35 @@
 # pre-built (collectstatic ran in PostHog's CI against the full EE tree) and
 # pulled, never running collectstatic locally.
 #
-# Wrapped in try/except so any future upstream refactor that breaks this
-# preload doesn't take the whole `ee` app down with it. If the preload
-# fails the cycle will simply re-fire at runtime, surfacing the issue.
+# Diagnostic: log when this preload runs and what state Django is in. If we
+# see the cycle still firing in collectstatic, the trace below tells us
+# whether (a) we ran too early (settings still mid-load) or (b) we ran but
+# something else short-circuited the preload.
+import sys as _sys
+
+_sys.stderr.write("[ee.models preload] starting; will load products.signals.backend.temporal\n")
+try:
+    from django.apps import apps as _apps
+
+    _sys.stderr.write(
+        f"[ee.models preload] apps_ready={_apps.apps_ready} models_ready={_apps.models_ready} ready={_apps.ready}\n"
+    )
+except Exception as _e:
+    _sys.stderr.write(f"[ee.models preload] could not read apps state: {_e!r}\n")
+_sys.stderr.flush()
+
 try:
     import products.signals.backend.temporal  # noqa: F401
+
+    _sys.stderr.write("[ee.models preload] OK: temporal preloaded\n")
+    _sys.stderr.flush()
 except Exception:
-    pass
+    import traceback
+
+    _sys.stderr.write("[ee.models preload] FAILED:\n")
+    traceback.print_exc(file=_sys.stderr)
+    _sys.stderr.flush()
+    raise
 
 from ee.models.conversation import Conversation
 from ee.models.dashboard_privilege import DashboardPrivilege
