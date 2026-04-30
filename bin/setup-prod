@@ -185,6 +185,66 @@ phase_preflight() {
 }
 
 # ============================================================================
+# Phase 2b: EE-stub sanity check
+# ============================================================================
+#
+# This fork ships ee/ as a stub package (see ee/__init__.py for the why).
+# Two failure modes the build ALWAYS hits when stubs go out of sync with
+# the codebase:
+#
+#   1. ee/ directory was removed (e.g. an upstream sync auto-strip ran).
+#      Build fails at `COPY ee ee/` and then again at every `from ee.*` import.
+#   2. New `from ee.X import Y` was added in upstream code but the matching
+#      stub doesn't exist yet. Django boot fails with ModuleNotFoundError.
+#
+# Both are recoverable, but the symptom (a long Docker build crashing late)
+# is expensive to diagnose. Catch both here with a fast static scan before
+# we kick off image builds. Soft-fail: warn loudly but don't block, because
+# (a) the actual import failure is more informative than a static scan
+# guess, and (b) we want the user to be able to override after auditing.
+
+phase_check_ee_stubs() {
+    log "Checking ee/ stub package integrity"
+
+    if [ ! -d "ee" ]; then
+        warn "ee/ directory missing. The Docker build will fail at 'COPY ee ee/'."
+        warn "Restore stubs with: git checkout HEAD -- ee/   (if previously committed)"
+        warn "Or restore upstream EE: git fetch upstream && git checkout upstream/master -- ee/"
+        return 0  # soft-fail: let the user proceed if they know what they're doing
+    fi
+
+    [ -f "ee/__init__.py" ] || warn "ee/__init__.py missing — ee is not a Python package."
+    [ -f "ee/apps.py" ]     || warn "ee/apps.py missing — Django won't register the ee app."
+
+    # Walk every `from ee.X.Y import Z` in posthog/ and products/ (skipping
+    # tests, since they're not loaded by production containers) and verify
+    # that ee/X/Y.py or ee/X/Y/__init__.py exists. Doesn't validate that Z
+    # is exported — the runtime import will catch that.
+    local missing=""
+    while IFS=: read -r file _ line; do
+        # Extract module path from `from ee.foo.bar import baz` → ee/foo/bar
+        local mod
+        mod=$(echo "$line" | sed -E 's/^[[:space:]]*from[[:space:]]+ee\.([A-Za-z0-9_.]+)[[:space:]]+import.*/\1/')
+        [ -n "$mod" ] || continue
+        local path="ee/${mod//.//}"
+        if [ ! -f "${path}.py" ] && [ ! -f "${path}/__init__.py" ]; then
+            missing="$missing\n  $file: $line  → expected ee/${mod//.//}{.py,/__init__.py}"
+        fi
+    done < <(grep -rEn '^[[:space:]]*from ee\.' posthog/ products/ \
+                --include='*.py' --exclude-dir='tests' --exclude-dir='test' \
+                2>/dev/null | grep -vE '/test_|conftest\.py' || true)
+
+    if [ -n "$missing" ]; then
+        warn "Production code imports from ee.* paths NOT covered by stubs:"
+        printf "$missing\n" | sort -u >&2
+        warn "Add stubs in ee/ or remove the imports before running migrate."
+        warn "(continuing — runtime imports may still fail)"
+    else
+        log "ee/ stub coverage looks complete"
+    fi
+}
+
+# ============================================================================
 # Phase 3: compose/ runtime scripts
 # ============================================================================
 
@@ -411,6 +471,7 @@ phase_apply_ttls() {
 
 phase_validate_env
 phase_preflight
+phase_check_ee_stubs
 phase_compose_scripts
 phase_geoip
 phase_pull
