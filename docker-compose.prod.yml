@@ -37,12 +37,26 @@ x-restart-prod: &restart-prod
 # `mem_limit` is enforced by plain `docker compose up`. The newer
 # `deploy.resources.limits` block is Swarm-only and silently ignored.
 #
+# Overcommit: the SUM of all caps below (~36 GB with ingestion-general at
+# 2 replicas) intentionally exceeds the 30 GB host. Caps are upper bounds,
+# not reservations — services don't all peak simultaneously. Realistic
+# steady-state usage is ~24-28 GB; the caps are spike absorbers. The 4 GB
+# swap (see bin/setup-swap) backstops the worst case where multiple
+# services peak at once. If you scale ingestion-general to 4 replicas
+# (or boot more services), trim other anchors or upgrade RAM.
+#
 # Tuning: after deploy, watch `docker stats` for 24-48 h. Bump any service
-# consistently above 80% of its limit; lower any service consistently
-# below 20%. Sum should stay under physical RAM minus ~2 GB for kernel +
-# Docker daemon, with 4 GB swap as a panic valve.
+# consistently above 80% of its cap; lower any service consistently below
+# 20%. ClickHouse cap is also a hard ceiling — bump only after also bumping
+# max_server_memory_usage in config.d.prod/memory_limits.xml.
 x-mem-clickhouse: &mem-clickhouse  { mem_limit: 10g,    memswap_limit: 10g }
-x-mem-postgres:   &mem-postgres    { mem_limit: 2500m,  memswap_limit: 2500m }
+# Postgres needs real headroom: shared_buffers (1g) + work_mem × max_connections
+# (16m × 200 = 3.2g worst case during sorts/hashes) + maintenance_work_mem ×
+# autovacuum_workers (256m × 3 = 768m) + WAL/per-backend overhead (~500m) =
+# ~5.5 GB worst case. 4 GB cgroup with 5 GB swap headroom keeps PG alive when
+# every Celery + Django + Node service hammers it at once. Lowering this also
+# requires lowering POSTGRES_MAX_CONNECTIONS or POSTGRES_WORK_MEM in .env.
+x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 x-mem-kafka:      &mem-kafka       { mem_limit: 3500m,  memswap_limit: 3500m }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
 x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
@@ -94,10 +108,31 @@ services:
         environment:
             POSTGRES_PASSWORD: ${POSTHOG_DB_PASSWORD}
         # Postgres tuning for a single-host install. Defaults (shared_buffers=128MB)
-        # are sized for embedded use, not a real workload. With 2.5 GB cgroup cap:
-        #   shared_buffers       = 25-40% of RAM available to PG
-        #   effective_cache_size = realistic OS page cache size (info only, not allocated)
-        #   max_connections      = generous; 100 is too low when worker spins up bursts
+        # are sized for embedded use, not a real workload. With 4 GB cgroup cap:
+        #   shared_buffers       = 25% of cgroup RAM (PG's own cache)
+        #   effective_cache_size = realistic OS page cache size (planner hint, not allocated)
+        #   work_mem             = per-sort/hash-join scratch (multiple per query)
+        #   max_connections      = generous; PostHog opens ~150 across all services
+        #
+        # Write-throughput knobs (matter for high-volume person-resolution UPSERTs):
+        #   synchronous_commit=off  - 3-5x write throughput on bursty workloads.
+        #                             Trade-off: lose last few seconds of unflushed
+        #                             transactions on a kernel/power crash. Acceptable
+        #                             for analytics — events can be re-derived from
+        #                             Kafka replay (6h retention). NOT acceptable for
+        #                             billing/financial data.
+        #   max_wal_size=4GB        - default 1GB triggers checkpoints every few
+        #                             minutes under load → I/O storms. 4GB stretches
+        #                             checkpoints to 15-30min intervals.
+        #   checkpoint_timeout=15min - paired with max_wal_size; smoother I/O.
+        #   checkpoint_completion_target=0.9 - spread checkpoint writes across 90%
+        #                             of the interval instead of bursting.
+        #   autovacuum_vacuum_scale_factor=0.05 - default 0.2 means vacuum kicks in
+        #                             only when 20% of a table is dead tuples. With
+        #                             posthog_person + posthog_persondistinctid
+        #                             being UPDATE-heavy, 5% keeps them lean.
+        #   autovacuum_naptime=20s  - default 60s; check more often on hot tables.
+        #
         # Tune via .env (POSTGRES_*) without rebuilding.
         command: >
             postgres
@@ -106,6 +141,12 @@ services:
             -c work_mem=${POSTGRES_WORK_MEM:-16MB}
             -c maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
             -c max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+            -c synchronous_commit=${POSTGRES_SYNCHRONOUS_COMMIT:-off}
+            -c max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}
+            -c checkpoint_timeout=${POSTGRES_CHECKPOINT_TIMEOUT:-15min}
+            -c checkpoint_completion_target=0.9
+            -c autovacuum_vacuum_scale_factor=${POSTGRES_AUTOVACUUM_SCALE_FACTOR:-0.05}
+            -c autovacuum_naptime=${POSTGRES_AUTOVACUUM_NAPTIME:-20s}
         volumes:
             - postgres-data:/var/lib/postgresql/data
 
@@ -174,6 +215,12 @@ services:
             # Without this, anyone with shell access to the host can `docker exec
             # clickhouse clickhouse-client` and dump everything.
             - ./docker/clickhouse/users.d.prod/default-password.xml:/etc/clickhouse-server/users.d/default-password.xml
+            # Prod-only overlay: caps per-query memory at 3 GB so concurrent
+            # queries fit under max_server_memory_usage (8 GB). Without this,
+            # users.xml ships max_memory_usage=10 GB which exceeds the server
+            # cap — the second concurrent heavy query fails with a confusing
+            # "Memory limit (total) exceeded" error.
+            - ./docker/clickhouse/users.d.prod/memory_per_query.xml:/etc/clickhouse-server/users.d/memory_per_query.xml
             - ./docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
             - ./posthog/user_scripts:/var/lib/clickhouse/user_scripts
             - clickhouse-data:/var/lib/clickhouse
@@ -335,15 +382,38 @@ services:
             file: docker-compose.base.yml
             service: ingestion-general
         logging: *default-logging
+        # Two replicas. The Rust capture service partitions Kafka messages by
+        # `{token}:{distinct_id}` (rust/common/types/src/event.rs:304), so events
+        # for the same user always land on the same partition — two consumers
+        # in the same group safely parallelize without breaking person ordering.
+        # The accompanying partition bump on `events_plugin_ingestion` (3 parts,
+        # see kafka-init below) is required for both replicas to actually do
+        # work — otherwise the second consumer sits idle.
+        # Each replica gets its own mem_limit (1.5 GB), so this adds 1.5 GB to
+        # the total cgroup budget. Lower POSTGRES_MAX_CONNECTIONS to ~150 if
+        # you see "too many connections" — each replica opens its own pool.
+        deploy:
+            replicas: 2
         environment:
             <<: *pg-env
             CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
             ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        # Map-style depends_on so we can pin kafka-init to
+        # `service_completed_successfully`. Without this the second consumer
+        # could join the consumer group before partitions exist, briefly
+        # leaving the second replica idle (Kafka rebalances after kafka-init
+        # grows partitions, but it's an avoidable startup transient).
         depends_on:
-            - db
-            - redis7
-            - clickhouse
-            - kafka
+            db:
+                condition: service_healthy
+            redis7:
+                condition: service_healthy
+            clickhouse:
+                condition: service_started
+            kafka:
+                condition: service_healthy
+            kafka-init:
+                condition: service_completed_successfully
 
     ingestion-sessionreplay:
         <<: [*restart-prod, *mem-node]
@@ -705,8 +775,12 @@ services:
         entrypoint: /bin/sh
         logging: *default-logging
         environment:
-            # Sourced from .env. Defaults match a 1h / 128MB conservative profile.
-            KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-3600000}
+            # MUST match the kafka service default above (21600000 = 6h). The
+            # `rpk cluster config set` call below applies these values cluster-
+            # wide and overrides whatever the broker thinks. Keep both defaults
+            # in sync, otherwise a missing .env entry silently flips topics to
+            # the kafka-init default while the broker advertises something else.
+            KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-21600000}
             KAFKA_LOG_SEGMENT_SIZE: ${KAFKA_LOG_SEGMENT_SIZE:-134217728}
         command:
             - -c
@@ -739,8 +813,10 @@ services:
                 rpk cluster config set log_retention_check_interval_ms 60000 --brokers kafka:9092 || true
 
                 echo "Kafka broker is accepting requests, creating topics..."
-                # Create topics needed by rust services
-                # Note: $$ escapes $ for docker-compose variable substitution
+                # Create topics needed by rust services.
+                # Note: $$ escapes $ for docker-compose variable substitution.
+                #
+                # Single-partition topics (low traffic, no parallelism needed):
                 for topic in clickhouse_events_json; do
                     if rpk topic create "$$topic" --brokers kafka:9092 -p 1 -r 1 2>&1; then
                         echo "Topic $$topic created successfully"
@@ -750,6 +826,46 @@ services:
                         else
                             echo "Failed to create topic $$topic"
                             exit 1
+                        fi
+                    fi
+                done
+
+                # Multi-partition topics. ingestion-general runs with replicas=2;
+                # consumer parallelism is bounded by partition count. With 3
+                # partitions: 2 active consumers + 1 standby (handles rebalance).
+                # Rust capture partitions by `{token}:{distinct_id}` (see
+                # rust/common/types/src/event.rs:304), so per-user ordering
+                # holds regardless of partition count. The `_overflow` topic
+                # mirrors the main one because the same consumer drains both.
+                # Bump KAFKA_INGESTION_PARTITIONS in .env to 4-6 if you scale
+                # ingestion-general higher.
+                INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-3}
+                for topic in events_plugin_ingestion events_plugin_ingestion_overflow; do
+                    if rpk topic create "$$topic" --brokers kafka:9092 -p "$$INGEST_PARTS" -r 1 2>&1; then
+                        echo "Topic $$topic created with $$INGEST_PARTS partitions"
+                    else
+                        if ! rpk topic list --brokers kafka:9092 | grep -q "^$$topic"; then
+                            echo "Failed to create topic $$topic"
+                            exit 1
+                        fi
+                        # Topic already exists — likely auto-created by capture
+                        # before kafka-init ran. Count current partitions and grow
+                        # if needed. `rpk topic describe -p` prints one row per
+                        # partition with the partition number in column 1, so
+                        # counting numeric-leading rows gives the exact count.
+                        # `rpk topic add-partitions --num` ADDS that many (does
+                        # NOT set total) so we pass the delta, not the target.
+                        CURRENT=$$(rpk topic describe "$$topic" -p --brokers kafka:9092 2>/dev/null \
+                            | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+                        if [ "$$CURRENT" -lt "$$INGEST_PARTS" ]; then
+                            DELTA=$$((INGEST_PARTS - CURRENT))
+                            echo "Growing $$topic: $$CURRENT -> $$INGEST_PARTS partitions (+$$DELTA)"
+                            rpk topic add-partitions "$$topic" \
+                                --brokers kafka:9092 \
+                                --num "$$DELTA" \
+                                || echo "Failed to grow $$topic (need DELTA=$$DELTA), continuing"
+                        else
+                            echo "Topic $$topic already has $$CURRENT partitions (>= $$INGEST_PARTS), skipping"
                         fi
                     fi
                 done

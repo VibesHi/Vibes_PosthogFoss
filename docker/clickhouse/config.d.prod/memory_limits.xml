@@ -26,8 +26,16 @@
     uncompressed_cache_size   - cached uncompressed blocks (default 8 GB).
                                 Most queries don't benefit; 1 GB is fine.
 
-  Per-query memory cap is in users.xml (<max_memory_usage>10000000000</> = 10 GB).
-  Server cap MUST be larger than per-query cap, or single queries OOM the server.
+  Per-query memory cap is in users.d.prod/memory_per_query.xml (3 GB), which
+  overrides the 10 GB default from users.xml. Server cap (8 GB here) must be
+  >= per-query cap × N for the largest realistic concurrent N. With 3 GB
+  per-query and 8 GB server, ~2-3 heavy queries fit simultaneously; queries
+  beyond that fail with "Memory limit (total) for all queries exceeded" —
+  recoverable, the server stays alive.
+
+  If max_concurrent_queries × per-query > server cap (this config: 50 × 3 = 150 GB
+  vs 8 GB server), ClickHouse uses memory_overcommit to cancel the largest
+  in-progress query when the server cap is hit. Server stays alive either way.
 -->
 <clickhouse>
     <max_server_memory_usage>8589934592</max_server_memory_usage>             <!-- 8 GB -->

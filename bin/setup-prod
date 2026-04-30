@@ -157,15 +157,17 @@ phase_preflight() {
     fi
 
     # Swap: prod stack runs tight on a 30 GB box; 4 GB swap is panic-valve
-    # against transient spikes. setup-prod doesn't create it (host-level
-    # `fallocate /swapfile` + `swapon`), but warns if absent.
+    # against transient spikes. setup-prod doesn't create it because that
+    # touches /etc/fstab + kernel state, and many container/VPS hosts (LXC,
+    # restricted Docker hosts) forbid user-controlled swap. Use bin/setup-swap
+    # explicitly when the host allows it.
     local swap_gb=0
     if [ -f /proc/meminfo ]; then
         swap_gb=$(awk '/^SwapTotal:/ {print int($2/1024/1024)}' /proc/meminfo)
     fi
     if [ "$swap_gb" -lt 2 ]; then
         warn "Swap is ${swap_gb} GB (recommend 4 GB). Without swap, transient memory spikes will OOM-kill the largest container instead of paging out."
-        warn "Create with:  fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+        warn "Create with:  sudo bin/setup-swap        # idempotent, validates host support"
     fi
 
     # Disk: prod build + ClickHouse data + replay blobs + container logs.
@@ -318,13 +320,33 @@ phase_compose_up() {
     local max_attempts=3 attempt
     for attempt in $(seq 1 $max_attempts); do
         log "Starting stack (attempt $attempt/$max_attempts)"
-        if dc up -d; then return 0; fi
+        if dc up -d; then
+            phase_verify_replicas
+            return 0
+        fi
         if [ "$attempt" -lt "$max_attempts" ]; then
             warn "compose up failed — retrying in 30s"
             sleep 30
         fi
     done
     die "Failed to start stack after $max_attempts attempts. Check 'docker compose logs' for details."
+}
+
+# Sanity-check that `deploy.replicas: N` was honored. Compose v2.10+ honors
+# replicas in non-Swarm `up`, but older versions (<2.10) silently start one
+# replica regardless. Catches a lurking config bug if someone backports this
+# stack to an older Docker Engine.
+phase_verify_replicas() {
+    local svc="ingestion-general" expected=2 actual
+    actual=$(dc ps --status running --format '{{.Service}}' 2>/dev/null \
+        | grep -c "^${svc}\$" || true)
+    if [ "$actual" -lt "$expected" ]; then
+        warn "Expected $expected '${svc}' replicas, got $actual."
+        warn "Check: docker compose version (need v2.10+) and 'docker compose ps ${svc}'"
+        warn "Workaround: add '--scale ${svc}=${expected}' to compose up if the deploy.replicas key isn't honored."
+    else
+        log "Replica check: ${svc}=$actual (expected $expected) ✓"
+    fi
 }
 
 # ============================================================================

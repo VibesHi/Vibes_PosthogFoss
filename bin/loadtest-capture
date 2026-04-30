@@ -101,10 +101,16 @@ esac
 # ----- Cleanup mode -----
 if [ "$MODE" = "cleanup" ]; then
     [ -n "$CH_PASSWORD" ] || die "CLICKHOUSE_PASSWORD not in .env, cannot clean up."
+    # Defense in depth: filter on the loadtest_marker property too, not just
+    # the event name. If a real user actually emits an event called
+    # "loadtest_ping", we don't want to nuke their data. The capture-side
+    # template stamps loadtest_marker=true; both predicates are required.
     log "Deleting loadtest events from posthog.sharded_events"
     $SUDO docker compose exec -T clickhouse clickhouse-client \
         --password="$CH_PASSWORD" \
-        --query "ALTER TABLE posthog.sharded_events DELETE WHERE event = 'loadtest_ping'"
+        --query "ALTER TABLE posthog.sharded_events DELETE
+                 WHERE event = 'loadtest_ping'
+                   AND JSONExtractBool(properties, 'loadtest_marker') = 1"
     log "Note: ALTER ... DELETE is a mutation and runs asynchronously."
     log "Check progress: SELECT * FROM system.mutations WHERE table='sharded_events' AND NOT is_done"
     ok "Cleanup mutation queued"

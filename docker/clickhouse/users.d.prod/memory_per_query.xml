@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Production overlay: caps per-query memory at 3 GB.
+
+  Mounted by docker-compose.prod.yml at:
+    /etc/clickhouse-server/users.d/memory_per_query.xml
+
+  Why this exists:
+    docker/clickhouse/users.xml ships with <max_memory_usage>10000000000</> (10 GB)
+    in the `default` profile. With max_server_memory_usage=8 GB (set in
+    config.d.prod/memory_limits.xml), a single query can theoretically allocate
+    more than the entire server cap. The server-level cap protects the host
+    (server-level rejection kicks in first), but the practical effect is:
+
+      - Two concurrent heavy queries each requesting 5 GB → second fails with
+        "Memory limit (total) for all queries exceeded".
+      - Dashboard with 3 charts open at once → 1-2 charts fail with cryptic CH errors.
+
+    Capping per-query at 3 GB lets ~2-3 heavy queries fit in the 8 GB server cap
+    simultaneously, with headroom for marks/uncompressed caches.
+
+  Tune for your host:
+    - 16 GB host RAM → bump server cap to 12 GB AND per-query to 4 GB
+    - 32 GB+ host RAM → bump server cap to 24 GB AND per-query to 8 GB
+
+  Settings here merge into the `default` profile from users.xml (overlay
+  semantics — only this one key is replaced, rest of the profile is preserved).
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <!-- 3 GB per single query; server cap is 8 GB so 2-3 concurrent fit. -->
+            <max_memory_usage>3221225472</max_memory_usage>
+            <!-- Same cap for distributed/joined query stages on this server. -->
+            <max_memory_usage_for_user>6442450944</max_memory_usage_for_user>
+        </default>
+    </profiles>
+</clickhouse>

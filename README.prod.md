@@ -218,9 +218,12 @@ on a default hobby install.
 | `kafka-init` enhanced with `rpk cluster config set log_retention_ms` + topic-level `alter-config` | prod.yml | base.yml's `--mode dev-container` silently ignores broker-level retention env vars. Without cluster + topic-level overrides, Redpanda disk usage grows linearly until full. |
 | ClickHouse `system_log` TTLs via `docker/clickhouse/config.d.prod/system_log_ttl.xml` | new file, mounted in prod.yml | Without TTLs, `query_log` / `trace_log` / `metric_log` / `part_log` grow unbounded — tens of GB in a few weeks on a busy install. Now 7d retention. |
 | ClickHouse memory caps via `docker/clickhouse/config.d.prod/memory_limits.xml` | new file, mounted in prod.yml | Upstream `config.xml` sets `max_server_memory_usage_to_ram_ratio=0.9`. On a 30 GB box that means CH eats 27 GB and OOM-kills the rest of the stack under any load. Overlay caps to 8 GB hard limit + tightens `max_thread_pool_size` from 10000 (sized for 64-core servers) to 1000. |
-| Per-service `mem_limit` via YAML anchors | prod.yml top-of-file | Without these, a single runaway container takes the whole box. Sized for 30 GB / 8 cores; sum is ~30 GB so 4 GB host swap is recommended. |
+| Per-service `mem_limit` via YAML anchors | prod.yml top-of-file | Without these, a single runaway container takes the whole box. Sized for 30 GB / 8 cores. Sum of caps (~35 GB) intentionally overcommits — caps are spike absorbers, not reservations. 4 GB host swap (see `bin/setup-swap`) backstops simultaneous peaks. |
 | Redis raised from 200 MB to 1 GB + `volatile-lru` policy | prod.yml | Base.yml's 200 MB / `allkeys-lru` is too small for an instance that's also Celery broker + result backend + hypercache + flag cache + session-replay state. `allkeys-lru` evicts in-flight Celery messages under pressure; `volatile-lru` only evicts keys with TTL (caches), so queues survive. |
-| Postgres tuning via `command:` overrides (`shared_buffers=1GB` etc.) | prod.yml + `.env` | Image defaults (`shared_buffers=128MB`) are sized for embedded use. With 2.5 GB cgroup cap, give PG a real working set. Tunable via `POSTGRES_*` in `.env` without rebuilding. |
+| Postgres tuning via `command:` overrides (`shared_buffers=1GB` etc.) | prod.yml + `.env` | Image defaults (`shared_buffers=128MB`) are sized for embedded use. PG gets a 4 GB cgroup (with 5 GB swap headroom for transient `work_mem × max_connections` spikes — worst case ~5.5 GB at 200 conns × 16 MB sort/hash). Tunable via `POSTGRES_*` in `.env` without rebuilding. Lower `POSTGRES_MAX_CONNECTIONS` to 120 if you also want to lower the cgroup cap. |
+| Postgres write-throughput tuning (`synchronous_commit=off`, `max_wal_size=4GB`, autovacuum) | prod.yml + `.env` | Default fsync-on-commit + 1GB WAL + 5min checkpoints stalls writers under sustained ingest. New defaults give 3-5x write throughput at the cost of losing the last <200ms of unflushed transactions on a crash — acceptable for analytics (events replay from Kafka's 6h retention). NOT acceptable if you store anything you can't re-derive: flip `POSTGRES_SYNCHRONOUS_COMMIT=on` in `.env`. |
+| `ingestion-general` runs with `replicas: 2` | prod.yml | Single replica saturates around 1k events/s on this hardware (person-resolution + Postgres + ClickHouse writes). Two consumers in the same group parallelize work because Rust capture partitions Kafka by `{token}:{distinct_id}` — same user always lands on same partition, so per-user ordering survives. |
+| `events_plugin_ingestion` + `_overflow` pre-created with 3 partitions | prod.yml `kafka-init` | Redpanda auto-creates topics with 1 partition by default; with only 1 partition, the second `ingestion-general` replica sits idle in standby. 3 partitions = 2 active consumers + 1 spare for rebalances. Tunable via `KAFKA_INGESTION_PARTITIONS` for higher replica counts. |
 | Kafka retention raised from 1 h → 6 h | prod.yml | 1 h is enough for normal operation but a 1 h overnight outage drops events. 6 h is the cheapest "I can sleep through a consumer crash" buffer. |
 | `CLICKHOUSE_SERVER_IMAGE` pinning via `.env` | prod.yml | Reproducible deploys; prevents silent CH version drift across hosts. |
 | `POSTHOG_DB_PASSWORD`, `OBJECT_STORAGE_PASSWORD`, `CLICKHOUSE_PASSWORD` from `.env` | `.env.example.prod`, prod.yml, `docker/clickhouse/users.d.prod/default-password.xml` | Hobby ships with well-known defaults (`posthog`/`posthog`, empty CH `default`, `object_storage_root_password`). Anyone with shell or `docker exec` access on the host can dump data with these. See [Credentials](#credentials) below. |
@@ -365,9 +368,10 @@ x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
 ```
 
 Bump `mem_limit` for any service consistently above 80 % of its cap.
-Lower for any service consistently below 20 %. Sum of all `mem_limit`
-should stay under physical RAM minus ~2 GB (kernel + Docker daemon),
-relying on swap as a buffer.
+Lower for any service consistently below 20 %. Caps overcommit physical
+RAM by design (sum ≈ 35 GB on a 30 GB box) — they're upper bounds, not
+reservations. Real steady-state usage is ~22-25 GB. Swap (set via
+`bin/setup-swap`) absorbs simultaneous peaks.
 
 ClickHouse's hard cap is in two places — keep them in sync:
 
@@ -377,6 +381,72 @@ ClickHouse's hard cap is in two places — keep them in sync:
 The cgroup limit should be ~20 % above the server self-limit so CH never
 hits the docker OOM-killer (which is unrecoverable) — instead it throws
 "Memory limit exceeded" at the query level (recoverable).
+
+### Scaling ingestion-general
+
+The default config runs `ingestion-general` with `replicas: 2`, parallelized
+via 3 Kafka partitions on `events_plugin_ingestion` and its overflow topic.
+Each replica is capped at 1.5 GB. Capacity ceiling is roughly **2-3k
+events/s sustained** on this hardware, depending on hog functions / person
+resolution cache hit rate.
+
+To scale further:
+
+```yaml
+# docker-compose.prod.yml
+ingestion-general:
+    deploy:
+        replicas: 4
+```
+
+```bash
+# .env — partitions = replicas + 1 for rebalance headroom
+KAFKA_INGESTION_PARTITIONS=5
+```
+
+Then:
+
+```bash
+docker compose up -d ingestion-general
+docker compose restart kafka-init   # idempotently grows partitions in place
+```
+
+Costs: each replica adds 1.5 GB to the cgroup budget. At 4 replicas you're
+adding 4.5 GB on top of the existing 3 GB — keep an eye on `docker stats`
+and free disk for the extra Kafka partition data (~20-50 MB per partition).
+
+### Postgres write contention
+
+If you see Kafka consumer lag growing on `events_plugin_ingestion` while
+`docker stats` shows ingestion-general at <60% CPU, the bottleneck is
+Postgres write contention on `posthog_person` / `posthog_persondistinctid`.
+Diagnose with:
+
+```bash
+docker compose exec db psql -U posthog -c "
+  SELECT relname, n_dead_tup, n_live_tup,
+         round(100*n_dead_tup::numeric/NULLIF(n_live_tup, 0), 1) AS dead_pct
+  FROM pg_stat_user_tables
+  WHERE schemaname='public' AND n_dead_tup > 1000
+  ORDER BY n_dead_tup DESC LIMIT 10;
+"
+
+docker compose exec db psql -U posthog -c "
+  SELECT pid, now() - xact_start AS xact_duration, wait_event_type, wait_event, query
+  FROM pg_stat_activity
+  WHERE state != 'idle' AND wait_event_type = 'Lock'
+  ORDER BY xact_start;
+"
+```
+
+If `dead_pct > 20%` on `posthog_person*`, autovacuum is falling behind.
+Lower `POSTGRES_AUTOVACUUM_SCALE_FACTOR` to `0.02` and restart `db`.
+
+If you see `Lock` waits on the same `posthog_person` rows, you have hot
+distinct_ids (e.g. shared API key, single test user generating lots of
+events). The fix is application-side — make your distinct_ids actually
+distinct, or set `process_person_profile=false` on bot/test traffic so PG
+isn't touched at all.
 
 ### Load testing the capture endpoint
 
