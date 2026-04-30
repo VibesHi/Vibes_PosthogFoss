@@ -625,7 +625,15 @@ services:
         volumes:
             - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
     elasticsearch:
-        <<: *mem-storage
+        # Bumped from *mem-storage (384m) to 1g. base.yml ships ES with
+        # ES_JAVA_OPTS=-Xms256m -Xmx256m AND the JVM's default
+        # -XX:MaxDirectMemorySize=128m, so JVM heap+direct alone is 384 MiB —
+        # leaving 0 for metaspace, code cache, native heap, page cache. The
+        # cgroup OOM-killer fires every ~10 min once Lucene merges and ingest
+        # pipelines warm up. 1g gives ~600 MiB headroom above heap+direct,
+        # which keeps it stable under PostHog's normal load.
+        mem_limit: 1g
+        memswap_limit: 1g
         extends:
             file: docker-compose.base.yml
             service: elasticsearch
