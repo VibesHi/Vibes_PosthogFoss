@@ -30,6 +30,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EE = ROOT / "ee"
 
+# Symbols whose ABSENCE from the stub is the intended FOSS behavior.
+# Production callers wrap `from ee.X import Y` in `try/except ImportError`
+# and use the absence as a "skip on FOSS" signal. Defining a no-op stub
+# here would defeat the guard and allow post-import side-effect code to
+# run -- which has actually broken CH migrations in this fork before. See
+# ee/clickhouse/materialized_columns/columns.py for the leading example.
+#
+# Format: {(ee_module_path, symbol)}.
+INTENTIONALLY_ABSENT: set[tuple[str, str]] = {
+    # Migration `0019_group_analytics_materialized_columns` and
+    # `0026_fix_materialized_window_and_session_ids` use:
+    #   try: from ee.clickhouse.materialized_columns.columns import materialize
+    #   except ImportError: return
+    # If `materialize` is defined, 0026 falls through to ALTER TABLE on
+    # `sharded_events` / `events` with `current_materialized_column = None`
+    # (gated by EE_AVAILABLE) and runs broken column ops.
+    ("clickhouse.materialized_columns.columns", "materialize"),
+}
+
 # Match `from ee.X.Y import a, b as c, d` even with line continuations
 # (we slurp parenthesized multi-line forms post-grep with a small parser below).
 FROM_IMPORT_HEAD = re.compile(r"^\s*from\s+ee\.([A-Za-z0-9_.]+)\s+import\s+(.+?)\s*$")
@@ -259,6 +278,8 @@ def main() -> int:
         defined = cache.setdefault(path, collect_module_names(path))
         for sym in names:
             if sym not in defined:
+                if (mod, sym) in INTENTIONALLY_ABSENT:
+                    continue
                 issues.append(
                     f"{file}:{lineno}: missing SYMBOL  ee.{mod}.{sym}  "
                     f"(add to {path.relative_to(ROOT)})"

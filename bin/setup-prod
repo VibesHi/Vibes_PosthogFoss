@@ -440,11 +440,45 @@ phase_async_migrations_check() {
         return 0
     fi
 
-    # `compose run --rm asyncmigrationscheck` brings up dependencies (db,
-    # redis, clickhouse, kafka) automatically via the worker chain in
-    # docker-compose.base.yml. The container exits non-zero if migrations
-    # are pending or fail their dry-run.
-    log "Existing install detected — running async migrations check"
+    # Step 1: mark no-op async migrations complete.
+    #
+    # Background: `posthog/apps.py::ready()` calls `setup_async_migrations()`
+    # at Django boot. With `SKIP_ASYNC_MIGRATIONS_SETUP=0` (the
+    # asyncmigrationscheck container's setting) the setup will raise
+    # ImproperlyConfigured for ANY async migration that is unapplied AND has
+    # `posthog_max_version` < `FROZEN_POSTHOG_VERSION` -- no `is_required()`
+    # check. On a fresh install, several migrations (e.g.
+    # `0004_replicated_schema`) are no-ops because we already create the
+    # tables in their post-state, but they sit in the AsyncMigration table as
+    # `not_started` and the boot crashes.
+    #
+    # `bin/migrate` solves this on first web boot by running
+    # `--complete-noop-migrations` BEFORE `--check`, but bin/migrate runs
+    # inside the web container at first start. setup-prod's
+    # `phase_async_migrations_check` runs in a separate `dc run --rm
+    # asyncmigrationscheck` container that has SKIP_ASYNC_MIGRATIONS_SETUP=0
+    # and crashes during AppConfig.ready() before its --check argument is
+    # ever consulted.
+    #
+    # Workaround: reuse the worker image (same code) but force
+    # SKIP_ASYNC_MIGRATIONS_SETUP=1 so apps.py:ready() skips the strict
+    # version gate, then invoke `run_async_migrations
+    # --complete-noop-migrations` which calls setup_async_migrations(
+    # ignore_posthog_version=True) internally and marks no-op migrations
+    # complete. After this, the regular asyncmigrationscheck succeeds.
+    log "Existing install detected — marking no-op async migrations complete"
+    if ! dc run --rm \
+        -e SKIP_ASYNC_MIGRATIONS_SETUP=1 \
+        worker python manage.py run_async_migrations --complete-noop-migrations; then
+        warn "Could not mark no-op async migrations complete — async check may fail"
+    fi
+
+    # Step 2: strict check via the dedicated container with
+    # SKIP_ASYNC_MIGRATIONS_SETUP=0 (its compose default). Brings up
+    # dependencies automatically via the worker chain in
+    # docker-compose.base.yml. Non-zero exit means migrations are pending or
+    # failed their dry-run.
+    log "Running async migrations check"
     if ! dc run --rm asyncmigrationscheck; then
         die "Pending async migrations. See https://posthog.com/docs/runbook/async-migrations and resolve before continuing."
     fi
