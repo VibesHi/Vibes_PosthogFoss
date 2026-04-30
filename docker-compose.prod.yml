@@ -27,6 +27,37 @@ x-logging: &default-logging
 x-restart-prod: &restart-prod
     restart: unless-stopped
 
+# Per-service memory caps. Sized for a 30 GB / 8-core single-host install.
+# Without these, a single runaway container (most often `clickhouse`, `web`,
+# or one of the Node ingestion services) takes the whole box. ClickHouse has
+# its own internal cap in docker/clickhouse/config.d.prod/memory_limits.xml
+# (8 GB max_server_memory_usage); this docker-level cap (10 GB) gives the
+# CH cgroup ~2 GB headroom for kernel page cache + buffers.
+#
+# `mem_limit` is enforced by plain `docker compose up`. The newer
+# `deploy.resources.limits` block is Swarm-only and silently ignored.
+#
+# Tuning: after deploy, watch `docker stats` for 24-48 h. Bump any service
+# consistently above 80% of its limit; lower any service consistently
+# below 20%. Sum should stay under physical RAM minus ~2 GB for kernel +
+# Docker daemon, with 4 GB swap as a panic valve.
+x-mem-clickhouse: &mem-clickhouse  { mem_limit: 10g,    memswap_limit: 10g }
+x-mem-postgres:   &mem-postgres    { mem_limit: 2500m,  memswap_limit: 2500m }
+x-mem-kafka:      &mem-kafka       { mem_limit: 3500m,  memswap_limit: 3500m }
+x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
+x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
+x-mem-django:     &mem-django      { mem_limit: 1200m,  memswap_limit: 1500m }
+x-mem-django-sm:  &mem-django-sm   { mem_limit: 768m,   memswap_limit: 1g }
+x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
+x-mem-node-hot:   &mem-node-hot    { mem_limit: 1500m,  memswap_limit: 1500m }
+x-mem-node-sm:    &mem-node-sm     { mem_limit: 384m,   memswap_limit: 512m }
+x-mem-temporal:   &mem-temporal    { mem_limit: 768m,   memswap_limit: 1g }
+x-mem-storage:    &mem-storage     { mem_limit: 384m,   memswap_limit: 512m }
+x-mem-rust:       &mem-rust        { mem_limit: 256m,   memswap_limit: 384m }
+x-mem-rust-hot:   &mem-rust-hot    { mem_limit: 384m,   memswap_limit: 512m }
+x-mem-tiny:       &mem-tiny        { mem_limit: 256m,   memswap_limit: 256m }
+x-mem-xtiny:      &mem-xtiny       { mem_limit: 128m,   memswap_limit: 128m }
+
 # Postgres connection env block. Swaps the `posthog`/`posthog` default that
 # dev-services.env + base.yml hardcode. Merged into every service that talks
 # to Postgres via `<<: *pg-env`. Unused vars (e.g. PERSONS_URL on a service
@@ -52,6 +83,7 @@ x-pg-env: &pg-env
 
 services:
     db:
+        <<: *mem-postgres
         extends:
             file: docker-compose.base.yml
             service: db
@@ -61,13 +93,43 @@ services:
         # and POSTGRES_DB stay as `posthog` — only the password is parameterized.
         environment:
             POSTGRES_PASSWORD: ${POSTHOG_DB_PASSWORD}
+        # Postgres tuning for a single-host install. Defaults (shared_buffers=128MB)
+        # are sized for embedded use, not a real workload. With 2.5 GB cgroup cap:
+        #   shared_buffers       = 25-40% of RAM available to PG
+        #   effective_cache_size = realistic OS page cache size (info only, not allocated)
+        #   max_connections      = generous; 100 is too low when worker spins up bursts
+        # Tune via .env (POSTGRES_*) without rebuilding.
+        command: >
+            postgres
+            -c shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB}
+            -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-3GB}
+            -c work_mem=${POSTGRES_WORK_MEM:-16MB}
+            -c maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+            -c max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
         volumes:
             - postgres-data:/var/lib/postgresql/data
 
     redis7:
+        <<: *mem-redis
         extends:
             file: docker-compose.base.yml
             service: redis7
+        # Override base.yml's `--maxmemory 200mb --maxmemory-policy allkeys-lru`.
+        # Reasons:
+        #   1. 200 MB is too small. This Redis is shared by Celery (broker +
+        #      result backend), team token cache, hypercache RemoteConfig
+        #      blobs, feature flags, CDP state, cookieless tracking, replay
+        #      API state, and various app caches. Cloud separates these into
+        #      multiple Redis instances; we don't.
+        #   2. `allkeys-lru` evicts ANY key under pressure, including in-flight
+        #      Celery messages. `volatile-lru` only evicts keys with a TTL, so
+        #      app cache entries get evicted first and Celery queues survive.
+        #   3. Persistence (RDB + AOF) is wasted IO for a pure cache + ephemeral
+        #      queue. Celery beat re-emits unfinished periodic tasks on restart;
+        #      caches re-warm fast. Flip `--appendonly yes` if you ever need
+        #      durability across power-cuts.
+        # Bump --maxmemory to 2gb if `INFO stats` shows evicted_keys climbing.
+        command: redis-server --maxmemory-policy volatile-lru --maxmemory 1gb --save "" --appendonly no
         logging: *default-logging
         volumes:
             - redis7-data:/data
@@ -77,6 +139,7 @@ services:
         # Note: please keep the default version in sync across
         #       `posthog` and the `charts-clickhouse` repos
         #
+        <<: *mem-clickhouse
         extends:
             file: docker-compose.base.yml
             service: clickhouse
@@ -102,6 +165,10 @@ services:
             # trace_log / metric_log / part_log grow unbounded — tens of GB on
             # busy installs in a few weeks.
             - ./docker/clickhouse/config.d.prod/system_log_ttl.xml:/etc/clickhouse-server/config.d/system_log_ttl.xml
+            # Prod-only overlay: server memory + concurrency caps. Without this,
+            # max_server_memory_usage_to_ram_ratio=0.9 from config.xml lets CH
+            # grab 90% of host RAM, OOM-killing everything else under load.
+            - ./docker/clickhouse/config.d.prod/memory_limits.xml:/etc/clickhouse-server/config.d/memory_limits.xml
             - ./docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
             # Prod-only overlay: sets a password on the `default` user via from_env.
             # Without this, anyone with shell access to the host can `docker exec
@@ -112,6 +179,7 @@ services:
             - clickhouse-data:/var/lib/clickhouse
 
     zookeeper:
+        <<: *mem-storage
         extends:
             file: docker-compose.base.yml
             service: zookeeper
@@ -127,21 +195,29 @@ services:
             - zookeeper-data:/data
             - zookeeper-logs:/logs
     kafka:
+        <<: *mem-kafka
         extends:
             file: docker-compose.base.yml
             service: kafka
         logging: *default-logging
         depends_on:
             - zookeeper
+        # Retention defaults: 6 h ms / 6 h hours / 5 min check.
+        # Kafka here is a buffer between Rust capture and the consumers
+        # (plugin-server, ClickHouse Kafka engine). Healthy consumers drain
+        # messages within seconds; retention only matters as a recovery window
+        # if a consumer dies. 6 h covers overnight outages on a single-host
+        # box with auto-restart. Lower (1 h) saves disk; higher (24 h) gives
+        # more recovery slack at the cost of disk.
         environment:
-            KAFKA_LOG_RETENTION_MS: 3600000
+            KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-21600000}
             KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
-            KAFKA_LOG_RETENTION_HOURS: 1
+            KAFKA_LOG_RETENTION_HOURS: 6
         volumes:
             - kafka-data:/bitnami/kafka
 
     worker:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-django]
         image: posthog-app
         build: .
         extends:
@@ -176,7 +252,7 @@ services:
             web:
                 condition: service_started
     web:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-django-web]
         image: posthog-app
         build: .
         extends:
@@ -216,7 +292,7 @@ services:
             - seaweedfs
 
     plugins:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node]
         image: posthog-node
         build:
             context: .
@@ -250,7 +326,7 @@ services:
             - seaweedfs
 
     ingestion-general:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node-hot]
         image: posthog-node
         build:
             context: .
@@ -270,7 +346,7 @@ services:
             - kafka
 
     ingestion-sessionreplay:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node]
         image: posthog-node
         build:
             context: .
@@ -293,7 +369,7 @@ services:
             - seaweedfs
 
     recording-api:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node-sm]
         image: posthog-node
         build:
             context: .
@@ -312,7 +388,7 @@ services:
             - clickhouse
 
     ingestion-error-tracking:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node-sm]
         image: posthog-node
         build:
             context: .
@@ -330,7 +406,7 @@ services:
             - kafka
 
     ingestion-logs:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node-sm]
         image: posthog-node
         build:
             context: .
@@ -347,7 +423,7 @@ services:
             - kafka
 
     ingestion-traces:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-node-sm]
         image: posthog-node
         build:
             context: .
@@ -364,6 +440,7 @@ services:
             - kafka
 
     proxy:
+        <<: *mem-tiny
         extends:
             file: docker-compose.base.yml
             service: proxy
@@ -381,6 +458,7 @@ services:
             - web
             - livestream
     objectstorage:
+        <<: *mem-storage
         extends:
             file: docker-compose.base.yml
             service: objectstorage
@@ -402,6 +480,7 @@ services:
             - '127.0.0.1:19001:19001'
 
     seaweedfs:
+        <<: *mem-storage
         extends:
             file: docker-compose.base.yml
             service: seaweedfs
@@ -427,6 +506,7 @@ services:
             start_period: 10s
 
     asyncmigrationscheck:
+        <<: *mem-django-web
         image: posthog-app
         build: .
         extends:
@@ -446,6 +526,7 @@ services:
 
     # Temporal containers
     temporal:
+        <<: *mem-temporal
         extends:
             file: docker-compose.base.yml
             service: temporal
@@ -467,11 +548,13 @@ services:
         volumes:
             - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
     elasticsearch:
+        <<: *mem-storage
         extends:
             file: docker-compose.base.yml
             service: elasticsearch
         logging: *default-logging
     temporal-admin-tools:
+        <<: *mem-xtiny
         extends:
             file: docker-compose.base.yml
             service: temporal-admin-tools
@@ -479,6 +562,7 @@ services:
         depends_on:
             - temporal
     temporal-ui:
+        <<: *mem-tiny
         extends:
             file: docker-compose.base.yml
             service: temporal-ui
@@ -494,7 +578,7 @@ services:
             db:
                 condition: service_healthy
     temporal-django-worker:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-django-sm]
         image: posthog-app
         build: .
         command: /compose/temporal-django-worker
@@ -520,7 +604,7 @@ services:
             - temporal
 
     cyclotron-janitor:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust]
         image: posthog-cyclotron-janitor
         extends:
             file: docker-compose.base.yml
@@ -538,7 +622,7 @@ services:
                 condition: service_started
 
     capture:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust-hot]
         image: posthog-capture
         build:
             context: ./rust
@@ -548,7 +632,7 @@ services:
         logging: *default-logging
 
     replay-capture:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust-hot]
         image: posthog-replay-capture
         build:
             context: ./rust
@@ -558,7 +642,7 @@ services:
         logging: *default-logging
 
     property-defs-rs:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust]
         image: posthog-property-defs-rs
         build:
             context: ./rust
@@ -575,7 +659,7 @@ services:
                 condition: service_healthy
 
     livestream:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-tiny]
         image: posthog-livestream
         build:
             context: ./livestream
@@ -589,7 +673,7 @@ services:
             - ./docker/livestream/configs-hobby.yml:/configs/configs.yml
 
     feature-flags:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust-hot]
         image: posthog-feature-flags
         build:
             context: ./rust
@@ -604,7 +688,7 @@ services:
             - redis7
 
     hypercache-server:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust]
         image: posthog-hypercache-server
         build:
             context: ./rust
@@ -616,6 +700,7 @@ services:
             - redis7
 
     kafka-init:
+        <<: *mem-tiny
         image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
         entrypoint: /bin/sh
         logging: *default-logging
@@ -688,7 +773,7 @@ services:
                 condition: service_healthy
 
     cymbal:
-        <<: *restart-prod
+        <<: [*restart-prod, *mem-rust]
         image: posthog-cymbal
         build:
             context: ./rust

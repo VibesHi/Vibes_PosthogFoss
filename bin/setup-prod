@@ -143,26 +143,43 @@ phase_preflight() {
     dc version >/dev/null 2>&1 \
         || die "docker compose v2 plugin not found. Install docker-compose-plugin or upgrade docker."
 
-    # Memory: PostHog needs ~8GB at idle, more with frontend builds.
+    # Memory: prod compose has 32 services with ~30 GB of mem_limit budget.
+    # Below 16 GB the stack will OOM-cascade as soon as ClickHouse warms up.
+    # 8 GB is enough only with most ingestion services disabled.
     local mem_gb=0
     if [ -f /proc/meminfo ]; then
         mem_gb=$(awk '/^MemTotal:/ {print int($2/1024/1024)}' /proc/meminfo)
     elif command -v sysctl >/dev/null 2>&1; then
         mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
     fi
-    if   [ "$mem_gb" -eq 0 ];                       then warn "Could not detect RAM. PostHog needs 8GB+."
-    elif [ "$mem_gb" -lt 8 ];                       then warn "Detected ${mem_gb}GB RAM. PostHog needs 8GB+; builds may OOM."
+    if   [ "$mem_gb" -eq 0 ];                       then warn "Could not detect RAM. PostHog prod needs 16 GB+ for the full stack (or trim mem_limits in docker-compose.prod.yml)."
+    elif [ "$mem_gb" -lt 16 ];                      then warn "Detected ${mem_gb} GB RAM. PostHog prod needs 16 GB+ as configured. Either upgrade the host or trim mem_limits."
     fi
 
-    # Disk: builds + ClickHouse data + replay blobs add up. 50GB is the floor.
+    # Swap: prod stack runs tight on a 30 GB box; 4 GB swap is panic-valve
+    # against transient spikes. setup-prod doesn't create it (host-level
+    # `fallocate /swapfile` + `swapon`), but warns if absent.
+    local swap_gb=0
+    if [ -f /proc/meminfo ]; then
+        swap_gb=$(awk '/^SwapTotal:/ {print int($2/1024/1024)}' /proc/meminfo)
+    fi
+    if [ "$swap_gb" -lt 2 ]; then
+        warn "Swap is ${swap_gb} GB (recommend 4 GB). Without swap, transient memory spikes will OOM-kill the largest container instead of paging out."
+        warn "Create with:  fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    fi
+
+    # Disk: prod build + ClickHouse data + replay blobs + container logs.
+    # Build itself is 30-50 GB transient. Below 100 GB free, the build will
+    # likely fail mid-way with "no space left on device".
     # `df -BG` is a GNU-ism; on macOS this returns 0 and we silently skip.
     local avail_gb
     avail_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print int($4)}' || echo 0)
-    if [ "${avail_gb:-0}" -gt 0 ] && [ "$avail_gb" -lt 50 ]; then
-        warn "Only ${avail_gb}GB disk available. Recommend 100GB+ for builds + event data + replay."
+    if [ "${avail_gb:-0}" -gt 0 ] && [ "$avail_gb" -lt 100 ]; then
+        warn "Only ${avail_gb} GB disk available. Recommend 150 GB+ for build (30-50 GB transient) + event data + replay."
+        warn "Reclaim with:  docker system prune -a -f --volumes"
     fi
 
-    log "Pre-flight OK (RAM=${mem_gb}GB, disk=${avail_gb:-?}GB)"
+    log "Pre-flight OK (RAM=${mem_gb} GB, swap=${swap_gb} GB, disk=${avail_gb:-?} GB)"
 }
 
 # ============================================================================

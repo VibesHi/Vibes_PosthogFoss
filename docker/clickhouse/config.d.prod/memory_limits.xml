@@ -1,0 +1,39 @@
+<!--
+  Production overlay for ClickHouse memory and concurrency caps.
+
+  Mounted by docker-compose.prod.yml at:
+    /etc/clickhouse-server/config.d/memory_limits.xml
+
+  Why this exists:
+    config.xml ships with max_server_memory_usage_to_ram_ratio=0.9, which on
+    a 30 GB single-host install lets ClickHouse grab ~27 GB. That leaves
+    nothing for Postgres, Kafka, Django/Node services, and triggers cascading
+    OOM-kills under any meaningful load.
+
+  Settings here override config.xml for prod. Tune for your host:
+
+    max_server_memory_usage   - hard cap on RSS (in bytes). 8 GB is fine for
+                                a single-tenant hobby/mobile install with a
+                                few hundred MB of events. Bump to 12-16 GB
+                                if you have >32 GB host RAM.
+    max_thread_pool_size      - context-switch budget. Default 10000 is sized
+                                for 64-core servers; 1000 is plenty for 8 cores.
+    max_concurrent_queries    - global concurrency limit. Single-user installs
+                                rarely exceed 5 simultaneous queries; 50 is
+                                generous.
+    mark_cache_size           - cached primary-key marks (default 5 GB).
+                                1 GB is enough for hobby data volumes.
+    uncompressed_cache_size   - cached uncompressed blocks (default 8 GB).
+                                Most queries don't benefit; 1 GB is fine.
+
+  Per-query memory cap is in users.xml (<max_memory_usage>10000000000</> = 10 GB).
+  Server cap MUST be larger than per-query cap, or single queries OOM the server.
+-->
+<clickhouse>
+    <max_server_memory_usage>8589934592</max_server_memory_usage>             <!-- 8 GB -->
+    <max_server_memory_usage_to_ram_ratio>0.3</max_server_memory_usage_to_ram_ratio>
+    <max_thread_pool_size>1000</max_thread_pool_size>
+    <max_concurrent_queries>50</max_concurrent_queries>
+    <mark_cache_size>1073741824</mark_cache_size>                             <!-- 1 GB -->
+    <uncompressed_cache_size>1073741824</uncompressed_cache_size>             <!-- 1 GB -->
+</clickhouse>
