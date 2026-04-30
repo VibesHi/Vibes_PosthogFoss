@@ -63,15 +63,33 @@ docker compose up -d --build --force-recreate web
 1. **Validates `.env`** — fails fast if missing, if any `CHANGE_ME_*` sentinel
    remains, or if any of `DOMAIN`, `POSTHOG_SECRET`, `ENCRYPTION_SALT_KEYS`,
    `POSTHOG_DB_PASSWORD`, `OBJECT_STORAGE_PASSWORD`, `CLICKHOUSE_PASSWORD` is
-   empty. Also warns if any password is shorter than 16 characters.
-2. **Generates `compose/start`, `compose/temporal-django-worker`, `compose/wait`**
+   empty. Also warns if any password is shorter than 16 characters, and if
+   `.env` is missing keys that exist in `.env.example.prod` (schema drift after
+   `git pull`).
+2. **Pre-flight checks** — verifies `docker` + `docker compose` v2 are
+   installed and the daemon is reachable; warns if RAM &lt; 8 GB or disk &lt; 50 GB.
+3. **Generates `compose/start`, `compose/temporal-django-worker`, `compose/wait`**
    — only if they don't already exist (so your edits survive re-runs).
-3. **Downloads `share/GeoLite2-City.mmdb`** — only if missing. Auto-installs
-   `brotli` via `apt` if needed.
-4. **Builds and starts** via `docker compose -f docker-compose.prod.yml`.
-5. **Applies idempotent ClickHouse TTLs** — `MODIFY TTL` on
-   `sharded_log_entries` and `sharded_query_log_archive` (configurable via
-   `POSTHOG_LOG_ENTRIES_TTL_DAYS` / `POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS`).
+4. **Downloads `share/GeoLite2-City.mmdb`** — only if missing. Auto-installs
+   `brotli` via `apt-get` / `dnf` / `yum` / `pacman` (whichever is present).
+5. **Pulls third-party images** upfront (`docker compose pull
+   --ignore-pull-failures`). Surfaces network errors before any container
+   starts; locally-built services are silently skipped.
+6. **Builds local images** via `docker compose build`.
+7. **Async migrations check** — on existing installs (when `posthog_postgres-data`
+   or `posthog_clickhouse-data` volumes already exist), runs
+   `docker compose run --rm asyncmigrationscheck` and aborts if any are
+   pending. Skipped on fresh installs.
+8. **Starts the stack** via `docker compose up -d`, retrying up to 3× with 30s
+   backoff on failure.
+9. **Waits for ClickHouse readiness** — polls `clickhouse-client --password`
+   for up to 5 min until the rotated CH password is accepted. If the timeout
+   hits, exits with a warning rather than failing the whole run.
+10. **Applies idempotent ClickHouse TTLs** — waits up to 10 min for
+    `sharded_log_entries` / `sharded_query_log_archive` to be created by Django
+    migrations, then `MODIFY TTL` on each. Configurable via
+    `POSTHOG_LOG_ENTRIES_TTL_DAYS` / `POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS`.
+    Re-running self-heals if a future PostHog migration ever resets the TTL.
 
 The script does **not** generate `.env` — fully manual.
 

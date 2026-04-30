@@ -2,95 +2,198 @@
 #
 # bin/setup-prod -- per-host bootstrap for self-hosted PostHog (production-ish).
 #
-# Idempotent. Safe to re-run after pulling new code.
+# Idempotent. Safe to re-run after pulling new code. Phases are linear and
+# fail-fast except where explicitly noted (TTL apply warns rather than dies so
+# a flaky CH connection at the end doesn't waste the rest of the run).
 #
-# What it does:
-#   1. Validates that .env exists and has no CHANGE_ME_* placeholders left.
-#   2. Ensures compose/ runtime scripts (start, temporal-django-worker, wait) exist.
-#   3. Downloads share/GeoLite2-City.mmdb if missing.
-#   4. Builds and starts the stack via docker compose.
+# Phase numbers below match the section dividers further down in the file.
 #
-# Pre-reqs on the host:
-#   - docker + docker compose v2
-#   - curl, brotli (auto-installs brotli via apt if missing)
-#   - openssl (only used by the user when filling in .env)
+# Required: docker + compose v2, curl, brotli (auto-installed on common
+# distros), openssl (only used by the user when filling in .env).
 #
 
 set -euo pipefail
 
+# ============================================================================
+# Helpers
+# ============================================================================
+
+readonly C_BLUE=$'\033[1;34m'
+readonly C_YELLOW=$'\033[1;33m'
+readonly C_RED=$'\033[1;31m'
+readonly C_RESET=$'\033[0m'
+
+log()  { printf '%s[setup-prod]%s %s\n' "$C_BLUE"   "$C_RESET" "$*"; }
+warn() { printf '%s[setup-prod]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s[setup-prod]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-log()  { printf '\033[1;34m[setup-prod]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[setup-prod]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[setup-prod]\033[0m %s\n' "$*" >&2; exit 1; }
-
-# Use sudo only if not running as root.
+# sudo only when not root. Most docker invocations need it; preserve for
+# brotli installs too. Users in the `docker` group + passwordless sudo will
+# never see a prompt.
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
-# ---------- 1. Validate .env ----------
+# Shorthands. dc() everywhere so a future migration to e.g. `nerdctl compose`
+# is a one-line change.
+dc()       { $SUDO docker compose "$@"; }
+ch_query() { dc exec -T clickhouse clickhouse-client --password="$CLICKHOUSE_PASSWORD" --query "$1"; }
 
-[ -f .env ] || die ".env not found. Copy .env.example.prod to .env and fill it in:
+install_brotli() {
+    # Best-effort install across common package managers. Hard error if none
+    # is present so the user knows to install brotli manually.
+    if command -v brotli >/dev/null 2>&1; then return 0; fi
+    if   command -v apt-get >/dev/null 2>&1; then log "Installing brotli via apt-get"; $SUDO apt-get install -y --no-install-recommends brotli
+    elif command -v dnf     >/dev/null 2>&1; then log "Installing brotli via dnf";     $SUDO dnf install -y brotli
+    elif command -v yum     >/dev/null 2>&1; then log "Installing brotli via yum";     $SUDO yum install -y brotli
+    elif command -v pacman  >/dev/null 2>&1; then log "Installing brotli via pacman";  $SUDO pacman -S --noconfirm brotli
+    else die "brotli not found and no known package manager. Install brotli manually and re-run."
+    fi
+}
+
+# Polls a CH SQL predicate until it returns "1" or the timeout hits.
+# Args: <description> <timeout_seconds> <progress_interval_seconds> <query>
+# The query MUST return exactly "1" on success (e.g. `EXISTS table` or `SELECT 1`).
+ch_wait_for() {
+    local desc="$1" timeout="$2" interval="$3" query="$4"
+    local elapsed=0 result
+    log "Waiting for $desc (up to ${timeout}s)"
+    while [ "$elapsed" -lt "$timeout" ]; do
+        # On any failure (container down, auth fail, table missing) clickhouse-client
+        # writes to stderr (suppressed) and we get an empty / non-"1" result.
+        # `|| true` plus `set +o pipefail` for this one expression keeps the
+        # script alive while we retry.
+        result=$( { ch_query "$query" 2>/dev/null || true; } | tr -d '[:space:]')
+        if [ "$result" = "1" ]; then
+            log "  -> $desc ready"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+        if [ $((elapsed % interval)) -eq 0 ]; then
+            log "  -> still waiting on $desc (${elapsed}s elapsed)"
+        fi
+    done
+    return 1
+}
+
+# ============================================================================
+# Phase 1: Validate .env
+# ============================================================================
+
+phase_validate_env() {
+    [ -f .env ] || die ".env not found. Bootstrap with:
     cp .env.example.prod .env
     \$EDITOR .env"
 
-if grep -q '^[A-Z_]*=CHANGE_ME_' .env; then
-    grep -n '^[A-Z_]*=CHANGE_ME_' .env >&2
-    die ".env contains CHANGE_ME_ placeholders. Fill them in before running."
-fi
-
-# Source .env strictly to catch DOMAIN
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
-
-[ -n "${DOMAIN:-}" ]                 || die ".env: DOMAIN is empty"
-[ -n "${POSTHOG_SECRET:-}" ]         || die ".env: POSTHOG_SECRET is empty"
-[ -n "${ENCRYPTION_SALT_KEYS:-}" ]   || die ".env: ENCRYPTION_SALT_KEYS is empty"
-[ -n "${POSTHOG_DB_PASSWORD:-}" ]    || die ".env: POSTHOG_DB_PASSWORD is empty (run 'openssl rand -hex 24')"
-[ -n "${OBJECT_STORAGE_PASSWORD:-}" ] || die ".env: OBJECT_STORAGE_PASSWORD is empty (run 'openssl rand -hex 24')"
-[ -n "${CLICKHOUSE_PASSWORD:-}" ]    || die ".env: CLICKHOUSE_PASSWORD is empty (run 'openssl rand -hex 24')"
-
-# Sanity: warn if password length looks short. The 24-byte (48 hex chars)
-# convention is just a default; anything < 16 chars is suspicious.
-for var in POSTHOG_DB_PASSWORD OBJECT_STORAGE_PASSWORD CLICKHOUSE_PASSWORD; do
-    val="${!var}"
-    if [ "${#val}" -lt 16 ]; then
-        warn ".env: $var is shorter than 16 chars — consider regenerating with 'openssl rand -hex 24'"
+    if grep -q '^[A-Z_]*=CHANGE_ME_' .env; then
+        grep -n '^[A-Z_]*=CHANGE_ME_' .env >&2
+        die ".env contains CHANGE_ME_ placeholders. Fill them in before running."
     fi
-done
 
-log "Configured for DOMAIN=$DOMAIN"
+    # Source .env into our shell so compose subcommands inherit every var.
+    # Multi-token values must be quoted in .env (e.g. TLS_BLOCK="tls a b c")
+    # or `source` will fail with a "command not found" on the trailing tokens.
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
 
-# ---------- 2. compose/ runtime scripts ----------
+    local var val
+    for var in DOMAIN POSTHOG_SECRET ENCRYPTION_SALT_KEYS \
+               POSTHOG_DB_PASSWORD OBJECT_STORAGE_PASSWORD CLICKHOUSE_PASSWORD; do
+        [ -n "${!var:-}" ] || die ".env: $var is empty"
+    done
 
-mkdir -p compose
+    for var in POSTHOG_DB_PASSWORD OBJECT_STORAGE_PASSWORD CLICKHOUSE_PASSWORD; do
+        val="${!var}"
+        if [ "${#val}" -lt 16 ]; then
+            warn ".env: $var is only ${#val} chars — regenerate with 'openssl rand -hex 24'"
+        fi
+    done
 
-if [ ! -x compose/start ]; then
-    log "Creating compose/start"
-    cat > compose/start <<'EOF'
+    # Schema drift: warn (don't die) if .env.example.prod has keys missing
+    # from .env. Catches the common "I git pull'd, forgot to merge new vars".
+    local missing="" key
+    while IFS= read -r key; do
+        grep -qE "^${key}=" .env || missing="$missing $key"
+    done < <(grep -E '^[A-Z][A-Z0-9_]*=' .env.example.prod | cut -d= -f1)
+
+    if [ -n "$missing" ]; then
+        warn ".env is missing keys present in .env.example.prod:$missing"
+        warn "Copy them over and re-run."
+    fi
+
+    log "Configured for DOMAIN=$DOMAIN"
+}
+
+# ============================================================================
+# Phase 2: Pre-flight
+# ============================================================================
+
+phase_preflight() {
+    log "Running pre-flight checks"
+
+    command -v docker >/dev/null 2>&1 \
+        || die "docker not found. Install: https://docs.docker.com/engine/install/"
+    $SUDO docker info >/dev/null 2>&1 \
+        || die "docker daemon not reachable. Try 'systemctl start docker' or join the 'docker' group."
+    dc version >/dev/null 2>&1 \
+        || die "docker compose v2 plugin not found. Install docker-compose-plugin or upgrade docker."
+
+    # Memory: PostHog needs ~8GB at idle, more with frontend builds.
+    local mem_gb=0
+    if [ -f /proc/meminfo ]; then
+        mem_gb=$(awk '/^MemTotal:/ {print int($2/1024/1024)}' /proc/meminfo)
+    elif command -v sysctl >/dev/null 2>&1; then
+        mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+    fi
+    if   [ "$mem_gb" -eq 0 ];                       then warn "Could not detect RAM. PostHog needs 8GB+."
+    elif [ "$mem_gb" -lt 8 ];                       then warn "Detected ${mem_gb}GB RAM. PostHog needs 8GB+; builds may OOM."
+    fi
+
+    # Disk: builds + ClickHouse data + replay blobs add up. 50GB is the floor.
+    # `df -BG` is a GNU-ism; on macOS this returns 0 and we silently skip.
+    local avail_gb
+    avail_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print int($4)}' || echo 0)
+    if [ "${avail_gb:-0}" -gt 0 ] && [ "$avail_gb" -lt 50 ]; then
+        warn "Only ${avail_gb}GB disk available. Recommend 100GB+ for builds + event data + replay."
+    fi
+
+    log "Pre-flight OK (RAM=${mem_gb}GB, disk=${avail_gb:-?}GB)"
+}
+
+# ============================================================================
+# Phase 3: compose/ runtime scripts
+# ============================================================================
+
+write_if_missing() {
+    local path="$1"; shift
+    if [ ! -x "$path" ]; then
+        log "Creating $path"
+        cat > "$path"
+        chmod +x "$path"
+    fi
+}
+
+phase_compose_scripts() {
+    mkdir -p compose
+
+    write_if_missing compose/start <<'EOF'
 #!/bin/bash
 ./compose/wait
 ./bin/migrate
 ./bin/docker-server
 EOF
-    chmod +x compose/start
-fi
 
-if [ ! -x compose/temporal-django-worker ]; then
-    log "Creating compose/temporal-django-worker"
-    cat > compose/temporal-django-worker <<'EOF'
+    write_if_missing compose/temporal-django-worker <<'EOF'
 #!/bin/bash
 ./bin/temporal-django-worker
 EOF
-    chmod +x compose/temporal-django-worker
-fi
 
-if [ ! -x compose/wait ]; then
-    log "Creating compose/wait"
-    cat > compose/wait <<'EOF'
+    write_if_missing compose/wait <<'EOF'
 #!/usr/bin/env python3
 import socket, time
 
@@ -109,67 +212,185 @@ def loop():
 
 loop()
 EOF
-    chmod +x compose/wait
-fi
+}
 
-# ---------- 3. GeoIP database ----------
+# ============================================================================
+# Phase 4: GeoIP database
+# ============================================================================
 
-mkdir -p share
-
-if [ ! -f share/GeoLite2-City.mmdb ]; then
-    log "Downloading GeoIP database"
-    if ! command -v brotli >/dev/null 2>&1; then
-        log "Installing brotli"
-        $SUDO apt-get install -y --no-install-recommends brotli
+phase_geoip() {
+    mkdir -p share
+    if [ -f share/GeoLite2-City.mmdb ]; then
+        log "GeoIP database already present (skip)"
+        return 0
     fi
+
+    log "Downloading GeoIP database"
+    install_brotli
     curl -L https://mmdbcdn.posthog.net/ --http1.1 \
         | brotli --decompress --output=share/GeoLite2-City.mmdb
     printf '{"date": "%s"}\n' "$(date +%Y-%m-%d)" > share/GeoLite2-City.json
     chmod 644 share/GeoLite2-City.mmdb share/GeoLite2-City.json
     log "GeoIP database ready"
-else
-    log "GeoIP database already present (skip)"
+}
+
+# ============================================================================
+# Phase 5: Pull third-party images
+# ============================================================================
+
+phase_pull() {
+    # Pull upstream images (postgres, redpanda, redis, zookeeper, caddy, minio,
+    # seaweedfs, temporalio/*, elasticsearch) upfront. Surfaces network errors
+    # before any container starts and keeps `up` snappy.
+    #
+    # `--ignore-pull-failures` lets us skip locally-built services without
+    # failing the whole step (compose tries to pull `posthog-app` etc. and
+    # 404s — that's expected).
+    log "Pulling third-party images"
+    dc pull --ignore-pull-failures || warn "Some images failed to pull — continuing (build may still succeed if you have them cached)"
+}
+
+# ============================================================================
+# Phase 6: Build local images
+# ============================================================================
+
+phase_build() {
+    log "Building local images (20-40 min on first run, near-instant on re-run)"
+    dc build
+}
+
+# ============================================================================
+# Phase 7: Async migrations check
+# ============================================================================
+
+is_existing_install() {
+    # Hobby's heuristic: if Postgres OR ClickHouse named volumes exist, this
+    # is an upgrade and we MUST verify no async migrations are pending.
+    # Pending async migrations + new code = potential data corruption.
+    local project="${COMPOSE_PROJECT_NAME:-posthog}" vol
+    for vol in postgres-data clickhouse-data; do
+        if $SUDO docker volume ls --format '{{.Name}}' | grep -qE "^${project}_${vol}$"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+phase_async_migrations_check() {
+    if ! is_existing_install; then
+        log "Fresh install — skipping async migrations check"
+        return 0
+    fi
+
+    # `compose run --rm asyncmigrationscheck` brings up dependencies (db,
+    # redis, clickhouse, kafka) automatically via the worker chain in
+    # docker-compose.base.yml. The container exits non-zero if migrations
+    # are pending or fail their dry-run.
+    log "Existing install detected — running async migrations check"
+    if ! dc run --rm asyncmigrationscheck; then
+        die "Pending async migrations. See https://posthog.com/docs/runbook/async-migrations and resolve before continuing."
+    fi
+    log "Async migrations check passed"
+}
+
+# ============================================================================
+# Phase 8: Start the stack (with retry)
+# ============================================================================
+
+phase_compose_up() {
+    local max_attempts=3 attempt
+    for attempt in $(seq 1 $max_attempts); do
+        log "Starting stack (attempt $attempt/$max_attempts)"
+        if dc up -d; then return 0; fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            warn "compose up failed — retrying in 30s"
+            sleep 30
+        fi
+    done
+    die "Failed to start stack after $max_attempts attempts. Check 'docker compose logs' for details."
+}
+
+# ============================================================================
+# Phase 9: Wait for ClickHouse
+# ============================================================================
+# Two-stage wait:
+#   a. CH server reachable + accepts the rotated password (5min)
+#   b. (per-table, in phase 10) target table created by Django migrations (10min)
+#
+# Stage (a) failing means something's wrong with the CH config — bail out of
+# TTL application but don't die, so the user can fix and re-run.
+
+phase_wait_clickhouse_ready() {
+    if ch_wait_for "ClickHouse auth" 300 30 "SELECT 1"; then
+        return 0
+    fi
+    warn "ClickHouse didn't accept the rotated password in 5min."
+    warn "Likely causes: clickhouse container crash-looping, CLICKHOUSE_PASSWORD mismatch, or stale data dir from a previous install with a different password."
+    warn "Inspect with: docker compose logs clickhouse"
+    return 1
+}
+
+# ============================================================================
+# Phase 10: Apply runtime SQL TTLs (idempotent, best-effort)
+# ============================================================================
+# Re-applies on every run so values self-heal if a future PostHog migration
+# overwrites them. Each call returns non-zero on failure; we count failures
+# and reflect them in the final summary instead of dying.
+
+apply_ttl() {
+    local table="$1" time_col="$2" days="$3"
+    log "TTL: $table = $days days"
+
+    if ! ch_wait_for "table $table" 600 60 "EXISTS $table"; then
+        warn "  $table not present after 10min. Migrations may still be running."
+        warn "  Tail 'docker compose logs -f web' to monitor; re-run setup-prod once it's done."
+        return 1
+    fi
+
+    if ch_query "
+        ALTER TABLE $table
+            MODIFY TTL toDate($time_col) + INTERVAL $days DAY DELETE
+            SETTINGS materialize_ttl_after_modify = 1
+    "; then
+        log "  -> applied"
+        return 0
+    fi
+    warn "  -> ALTER failed (see error above)"
+    return 1
+}
+
+phase_apply_ttls() {
+    local failures=0
+    apply_ttl "posthog.sharded_log_entries"        "timestamp"  "${POSTHOG_LOG_ENTRIES_TTL_DAYS:-14}"        || failures=$((failures + 1))
+    apply_ttl "posthog.sharded_query_log_archive"  "event_date" "${POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS:-30}" || failures=$((failures + 1))
+    return "$failures"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+phase_validate_env
+phase_preflight
+phase_compose_scripts
+phase_geoip
+phase_pull
+phase_build
+phase_async_migrations_check
+phase_compose_up
+
+if ! phase_wait_clickhouse_ready; then
+    warn "Stack is up but ClickHouse isn't authenticating — TTLs not applied."
+    warn "Re-run 'bin/setup-prod' once 'docker compose ps' shows clickhouse healthy."
+    exit 0
 fi
 
-# ---------- 4. Build + start ----------
-# COMPOSE_FILE is read from .env, so no -f flag needed.
+ttl_failures=0
+phase_apply_ttls || ttl_failures=$?
 
-log "Building images (this can take 20-40 min on first run)"
-$SUDO docker compose build
-
-log "Starting stack"
-$SUDO docker compose up -d
-
-# ---------- 5. Runtime SQL tuning (idempotent) ----------
-# Re-applies on every run so values self-heal if PostHog migrations ever
-# overwrite them. Each block is best-effort: if CH isn't ready or the table
-# doesn't exist yet (fresh install before migrations finish), skip and
-# remind the user to re-run.
-
-apply_log_entries_ttl() {
-    local ttl_days="${POSTHOG_LOG_ENTRIES_TTL_DAYS:-14}"
-    log "Applying log_entries TTL = $ttl_days days"
-    $SUDO docker compose exec -T clickhouse clickhouse-client --query "
-        ALTER TABLE posthog.sharded_log_entries
-            MODIFY TTL toDate(timestamp) + INTERVAL $ttl_days DAY DELETE
-            SETTINGS materialize_ttl_after_modify = 1
-    " 2>/dev/null && log "  -> applied" \
-                 || warn "  -> skipped (clickhouse not ready, or sharded_log_entries doesn't exist yet — re-run bin/setup-prod after first migrations finish)"
-}
-
-apply_query_log_archive_ttl() {
-    local ttl_days="${POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS:-30}"
-    log "Applying query_log_archive TTL = $ttl_days days"
-    $SUDO docker compose exec -T clickhouse clickhouse-client --query "
-        ALTER TABLE posthog.sharded_query_log_archive
-            MODIFY TTL toDate(event_date) + INTERVAL $ttl_days DAY DELETE
-            SETTINGS materialize_ttl_after_modify = 1
-    " 2>/dev/null && log "  -> applied" \
-                 || warn "  -> skipped (clickhouse not ready, or sharded_query_log_archive doesn't exist yet — re-run bin/setup-prod after first migrations finish)"
-}
-
-apply_log_entries_ttl
-apply_query_log_archive_ttl
-
-log "Done. Tail logs with:"
-log "    docker compose logs -f web worker"
+if [ "$ttl_failures" -eq 0 ]; then
+    log "All phases complete. Tail logs with: docker compose logs -f web worker"
+else
+    warn "Done with $ttl_failures TTL apply failure(s). Re-run setup-prod after fixing."
+    exit 1
+fi
