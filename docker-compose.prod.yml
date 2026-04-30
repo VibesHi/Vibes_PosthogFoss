@@ -57,7 +57,14 @@ x-mem-clickhouse: &mem-clickhouse  { mem_limit: 10g,    memswap_limit: 10g }
 # every Celery + Django + Node service hammers it at once. Lowering this also
 # requires lowering POSTGRES_MAX_CONNECTIONS or POSTGRES_WORK_MEM in .env.
 x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
-x-mem-kafka:      &mem-kafka       { mem_limit: 3500m,  memswap_limit: 3500m }
+# Redpanda (kafka service) is told `--memory 3G --reserve-memory 500M` in
+# base.yml. seastar startup checks the cgroup limit and subtracts ~550 MiB for
+# its own overhead before comparing against `--memory`, so a 3500m cgroup
+# yields "available 2.87 GiB", short of the 3 GiB request and the container
+# crash-loops with `Could not initialize seastar: insufficient physical memory`.
+# 4g leaves ~1 GiB head-room above the 3G ask; bumping further only matters if
+# you also raise `--memory` in the command override.
+x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
 x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
 x-mem-django:     &mem-django      { mem_limit: 1200m,  memswap_limit: 1500m }
