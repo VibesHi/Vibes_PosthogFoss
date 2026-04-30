@@ -233,7 +233,12 @@ services:
             - clickhouse-data:/var/lib/clickhouse
 
     zookeeper:
-        <<: *mem-storage
+        # Override *mem-storage (384m) — ZK is a JVM workload and the default
+        # heap + JVM overhead pushes RSS to 98% of 384m on idle, OOM-loops
+        # under any DDL burst. CH ReplicatedMergeTree depends on this; if ZK
+        # dies, all CH writes block.
+        mem_limit: 768m
+        memswap_limit: 768m
         extends:
             file: docker-compose.base.yml
             service: zookeeper
@@ -244,6 +249,10 @@ services:
         environment:
             ZOO_AUTOPURGE_PURGEINTERVAL: 24
             ZOO_AUTOPURGE_SNAPRETAINCOUNT: 3
+            # Cap the JVM heap so it doesn't unilaterally try to grab the
+            # whole mem_limit. 256m heap leaves ~500m for non-heap (metaspace,
+            # threads, direct buffers, container overhead).
+            JVMFLAGS: '-Xms128m -Xmx256m'
         volumes:
             - zookeeper-datalog:/datalog
             - zookeeper-data:/data
