@@ -294,6 +294,10 @@ services:
             RECORDING_API_URL: http://recording-api:6738
             ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
             POSTHOG_SKIP_MIGRATION_CHECKS: '1'
+            # Celery prefork concurrency. Defaults to nproc (8 on this host) which OOMs
+            # the container — each prefork process holds a full Django+dagster heap (~400MB).
+            # 2 is plenty for self-hosted single-tenant; raise if task throughput needs it.
+            WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
         depends_on:
             db:
                 condition: service_healthy
