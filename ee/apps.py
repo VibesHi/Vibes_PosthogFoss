@@ -82,14 +82,50 @@ class EnterpriseConfig(AppConfig):
         _original_ready = PostHogConfig.ready
 
         def patched_ready(self, *args, **kwargs):
-            try:
-                import products.signals.backend.temporal  # noqa: F401
-            except Exception as exc:
-                sys.stderr.write(
-                    f"[ee.apps] signals.backend.temporal preload failed; "
-                    f"posthog.PostHogConfig.ready() may now hit the upstream "
-                    f"reingestion → api.py circular import: {exc!r}\n"
-                )
+            # Two-stage preload to break the upstream cycle:
+            #
+            # 1. Force the three temporal submodules that api.py:21-23
+            #    imports to fully load FIRST (in the order api.py itself
+            #    expects them). After this, sys.modules has buffer,
+            #    emitter, types fully populated.
+            # 2. Force api.py itself to load, which now succeeds because
+            #    its line-21 `from .temporal.buffer import
+            #    BufferSignalsWorkflow` resolves against the fully-loaded
+            #    buffer module from stage 1, and similarly for line 22-23.
+            #    api.py finishes, defining emit_signal at line 56.
+            #
+            # When _original_ready below hits posthog.api/__init__.py:30
+            # (`import products.signals.backend.views as signals`) and views
+            # transitively does `from products.signals.backend.api import
+            # emit_signal`, api.py is already in sys.modules with emit_signal
+            # bound, so no cycle.
+            #
+            # We do NOT preload `products.signals.backend.temporal` itself
+            # (the package): its __init__.py loads in source order and at
+            # line 14 hits `deletion → reingestion → api.py`, where api.py:21
+            # then tries to grab BufferSignalsWorkflow from a still-loading
+            # buffer.py and fails. By skipping temporal/__init__.py and
+            # loading the leaf submodules directly, we avoid that ordering.
+            for _module in (
+                "products.signals.backend.temporal.buffer",
+                "products.signals.backend.temporal.emitter",
+                "products.signals.backend.temporal.types",
+                "products.signals.backend.api",
+            ):
+                try:
+                    __import__(_module)
+                except Exception as exc:
+                    import traceback as _tb
+
+                    sys.stderr.write(
+                        f"[ee.apps] preload of {_module} failed; "
+                        f"posthog.PostHogConfig.ready() may now hit the "
+                        f"upstream reingestion → api.py circular import:\n"
+                        f"{exc!r}\n"
+                    )
+                    _tb.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+                    break
             return _original_ready(self, *args, **kwargs)
 
         patched_ready._ee_signals_preload_patched = True  # type: ignore[attr-defined]
