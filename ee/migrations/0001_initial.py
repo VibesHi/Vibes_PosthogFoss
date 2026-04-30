@@ -27,6 +27,8 @@ extra columns since EE_AVAILABLE=False keeps EE-gated branches dead.
 Fresh installs run this migration normally.
 """
 
+import uuid
+
 from django.db import migrations, models
 
 
@@ -36,10 +38,17 @@ class Migration(migrations.Migration):
     dependencies: list = []
 
     operations = [
+        # Role.id MUST be UUID (not BigAutoField) — real upstream EE has
+        # UUIDField here, and posthog/migrations/0717_*, 0829_*, 1117_* hardcode
+        # raw SQL like `REFERENCES "ee_role"("id")` with `role_id uuid NULL`.
+        # Postgres rejects FK from uuid → bigint with "incompatible types".
+        # Same applies to Conversation below — products/signals migration FKs
+        # to ee.conversation, and Django generates the FK column type from
+        # ee_conversation.id's declared type.
         migrations.CreateModel(
             name="Role",
             fields=[
-                ("id", models.BigAutoField(primary_key=True, serialize=False)),
+                ("id", models.UUIDField(default=uuid.uuid4, primary_key=True, serialize=False)),
                 ("name", models.CharField(max_length=200)),
             ],
             options={"db_table": "ee_role"},
@@ -78,7 +87,8 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="Conversation",
             fields=[
-                ("id", models.BigAutoField(primary_key=True, serialize=False)),
+                # See Role above for why this is UUID, not BigAutoField.
+                ("id", models.UUIDField(default=uuid.uuid4, primary_key=True, serialize=False)),
                 ("title", models.CharField(max_length=200, null=True)),
             ],
             options={"db_table": "ee_conversation"},
