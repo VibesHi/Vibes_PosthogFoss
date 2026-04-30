@@ -67,7 +67,7 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
 x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
-x-mem-django:     &mem-django      { mem_limit: 2500m,  memswap_limit: 2500m }
+x-mem-django:     &mem-django      { mem_limit: 3g,     memswap_limit: 3g    }
 x-mem-django-sm:  &mem-django-sm   { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
 x-mem-node-hot:   &mem-node-hot    { mem_limit: 1500m,  memswap_limit: 1500m }
@@ -298,6 +298,10 @@ services:
             # the container — each prefork process holds a full Django+dagster heap (~400MB).
             # 2 is plenty for self-hosted single-tenant; raise if task throughput needs it.
             WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+            # Recycle each prefork worker after N tasks to release accumulated heap
+            # (Django ORM caches, infi.clickhouse_orm metadata, leaks in dagster/etc).
+            # Without this, RSS grows to mem_limit and OOMs after ~hours of uptime.
+            CELERY_MAX_TASKS_PER_CHILD: ${CELERY_MAX_TASKS_PER_CHILD:-200}
         depends_on:
             db:
                 condition: service_healthy
