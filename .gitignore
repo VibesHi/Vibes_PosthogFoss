@@ -200,3 +200,9 @@ junit.xml
 # Downloaded GitHub issues for signals
 products/signals/backend/github_issues/
 .pnpm-store
+
+# Mirrored by bin/setup-prod from /proto so the rust build context
+# (rust/Dockerfile uses `context: ./rust`) can see the proto files.
+# Keeping rust/Dockerfile + docker-compose.prod.yml byte-identical to
+# upstream is worth the .gitignore line.
+/rust/proto/
