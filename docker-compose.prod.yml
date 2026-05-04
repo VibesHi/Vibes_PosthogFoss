@@ -66,7 +66,7 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 # you also raise `--memory` in the command override.
 x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
-x-mem-django-web: &mem-django-web  { mem_limit: 1500m,  memswap_limit: 2g }
+x-mem-django-web: &mem-django-web  { mem_limit: 2500m,  memswap_limit: 2500m }
 x-mem-django:     &mem-django      { mem_limit: 3g,     memswap_limit: 3g    }
 x-mem-django-sm:  &mem-django-sm   { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
@@ -362,6 +362,11 @@ services:
             # Pre-baking config into a temp statedir avoids the broken check
             # entirely. Bonus: skips a Unit double-start, halving boot time.
             NGINX_UNIT_PRELOAD_CONFIG: 'true'
+            # Cap prefork app workers. Default is 4; each loads full Django +
+            # dagster (~400MB resident). 4 × 400MB ≈ 1.6GB which OOMs the 2.5GB
+            # limit (need headroom for unit master + controller + router + JIT
+            # caches). 2 workers handle ample QPS for self-hosted single-tenant.
+            NGINX_UNIT_APP_PROCESSES: ${NGINX_UNIT_APP_PROCESSES:-2}
         depends_on:
             - db
             - redis7
@@ -519,6 +524,13 @@ services:
         logging: *default-logging
         environment:
             <<: *pg-env
+            # nodejs/src/logs-ingestion/config.ts line 64:
+            #   LOGS_REDIS_TLS: isProdEnv() ? true : false
+            # `isProdEnv()` returns true here, which makes the consumer's
+            # secondary Redis client attempt a TLS handshake against
+            # plaintext redis7:6379 — server never responds → ETIMEDOUT
+            # → restart loop. Force plaintext.
+            LOGS_REDIS_TLS: 'false'
         depends_on:
             - db
             - redis7
@@ -536,6 +548,8 @@ services:
         logging: *default-logging
         environment:
             <<: *pg-env
+            # Same reason as ingestion-logs above (config.ts line 115).
+            TRACES_REDIS_TLS: 'false'
         depends_on:
             - db
             - redis7
