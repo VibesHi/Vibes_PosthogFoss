@@ -149,18 +149,27 @@ phase_validate_env() {
     local caddy_tls_block_value="${TLS_BLOCK:-}"
     local caddy_env_changed=0
 
-    if ! grep -qE '^CADDY_HOST=' .env; then
-        printf 'CADDY_HOST=%s\n' "$caddy_host_value" >> .env
+    # Values MUST be double-quoted in .env: CADDY_HOST contains spaces and
+    # commas, and the surrounding `set -a; source .env; set +a` block we run
+    # at the start of this phase tokenizes unquoted values, treating
+    # `http://,` and `https://` as separate commands -> "No such file or
+    # directory". docker-compose strips the outer quotes when reading .env,
+    # so the container env stays correct.
+    local existing_caddy_host
+    existing_caddy_host=$(grep -E '^CADDY_HOST=' .env | head -1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/')
+
+    if [ -z "$existing_caddy_host" ] && ! grep -qE '^CADDY_HOST=' .env; then
+        printf 'CADDY_HOST="%s"\n' "$caddy_host_value" >> .env
         caddy_env_changed=1
-    elif [ "$(grep -E '^CADDY_HOST=' .env | head -1 | cut -d= -f2-)" != "$caddy_host_value" ]; then
+    elif [ -n "$existing_caddy_host" ] && [ "$existing_caddy_host" != "$caddy_host_value" ]; then
         warn "CADDY_HOST in .env doesn't match DOMAIN. Caddy will serve the .env value, not \$DOMAIN."
-        warn "  .env CADDY_HOST=$(grep -E '^CADDY_HOST=' .env | head -1 | cut -d= -f2-)"
+        warn "  .env CADDY_HOST=${existing_caddy_host}"
         warn "  derived          ${caddy_host_value}"
         warn "Edit .env manually if this is intentional."
     fi
 
     if ! grep -qE '^CADDY_TLS_BLOCK=' .env; then
-        printf 'CADDY_TLS_BLOCK=%s\n' "$caddy_tls_block_value" >> .env
+        printf 'CADDY_TLS_BLOCK="%s"\n' "$caddy_tls_block_value" >> .env
         caddy_env_changed=1
     fi
 
