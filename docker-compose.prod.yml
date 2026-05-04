@@ -637,7 +637,19 @@ services:
             - kafka
 
     proxy:
-        <<: *mem-tiny
+        # Caddy/proxy was the FIRST bottleneck found at 5k req/s loadtest:
+        # CPU peaked at 214% (=2 cores, mostly TLS handshakes) and memory hit
+        # 99.6% of the old 256m cap. Two fixes here:
+        # 1) Bump cgroup mem 256m -> 1g for TLS session buffers + connection
+        #    state under sustained burst.
+        # 2) Caddy auto-uses GOMAXPROCS=nproc cores, so no command-line CPU
+        #    knob needed -- the bottleneck on a 8-core host is mostly TLS
+        #    crypto throughput, which scales linearly with cores.
+        # Side effect: this raises the committed cap by 768m vs the old
+        # 256m mem-tiny default. Worth it -- proxy is the funnel for ALL
+        # ingress traffic.
+        mem_limit: 1g
+        memswap_limit: 1g
         extends:
             file: docker-compose.base.yml
             service: proxy
