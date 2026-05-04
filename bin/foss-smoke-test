@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# FOSS-fork smoke test: runs in the `web` container, exercises the OSS code
+# paths that have historically broken from EE-stub gaps. Every failure here
+# would have surfaced as a user-facing 500 in production.
+#
+# Run on prod:
+#   ./bin/foss-smoke-test
+#
+# Or one-shot ad hoc:
+#   docker compose exec web bash -c 'cd /code && bin/foss-smoke-test'
+#
+# Exit code 0 if all checks pass, 1 if any fail.
+
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Run the Python smoke probe inside the web container. The container has
+# DJANGO_SETTINGS_MODULE pre-set + the venv on PATH; outside it we'd need
+# `flox activate -- ...` first.
+if [ ! -f "/.dockerenv" ] && [ -z "${DJANGO_SETTINGS_MODULE:-}" ]; then
+    echo "Re-running inside web container..."
+    exec docker compose exec -T web bash -c 'cd /code && bin/foss-smoke-test'
+fi
+
+cd /code 2>/dev/null || true
+
+python3 <<'PYEOF'
+"""
+FOSS smoke test. Exercises every code path that has bitten us so far AND
+the systemic risk: any OSS class that inherits from an ee.* class must
+have all the methods OSS code calls via super().
+"""
+import importlib
+import inspect
+import sys
+import traceback
+from typing import Any
+
+import django
+django.setup()
+
+failures: list[str] = []
+
+# -------------------------------------------------------------------
+# 1) Confirm every ee.* module that OSS code imports loads cleanly.
+# -------------------------------------------------------------------
+EE_IMPORTS = [
+    "ee.api.rbac.access_control",
+    "ee.api.scim.utils",
+    "ee.api.session_summaries",
+    "ee.api.hooks",
+    "ee.api.foss_stubs",
+    "ee.api.ee_event_definition",
+    "ee.api.ee_property_definition",
+    "ee.api.vercel.tasks",
+    "ee.api.vercel.vercel_installation",
+    "ee.api.vercel.vercel_product",
+    "ee.api.vercel.vercel_proxy",
+    "ee.api.vercel.vercel_resource",
+    "ee.models",
+    "ee.models.license",
+    "ee.models.conversation",
+    "ee.models.dashboard_privilege",
+    "ee.models.event_definition",
+    "ee.models.property_definition",
+    "ee.models.explicit_team_membership",
+    "ee.models.feature_flag_role_access",
+    "ee.models.scim_provisioned_user",
+    "ee.models.scim_request_log",
+    "ee.models.session_summaries",
+    "ee.models.team_session_summaries_config",
+    "ee.models.rbac.access_control",
+    "ee.models.rbac.role",
+    "ee.models.rbac.organization_resource_access",
+    "ee.middleware",
+    "ee.settings",
+    "ee.urls",
+]
+for mod in EE_IMPORTS:
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        failures.append(f"IMPORT FAIL {mod}: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 2) Verify ee mixins implement every method OSS code calls via super().
+#    If OSS class C inherits AccessControlViewSetMixin and calls
+#    super().X() in its body, the mixin (or a class above it in the MRO)
+#    must define X.
+# -------------------------------------------------------------------
+EXPECTED_MIXIN_METHODS = {
+    "ee.api.rbac.access_control.AccessControlViewSetMixin": [
+        "dangerously_get_required_scopes",  # called by team.py:1354 + project.py:690
+    ],
+}
+for path, methods in EXPECTED_MIXIN_METHODS.items():
+    mod_name, _, cls_name = path.rpartition(".")
+    try:
+        cls = getattr(importlib.import_module(mod_name), cls_name)
+        for m in methods:
+            if not hasattr(cls, m):
+                failures.append(f"MIXIN MISSING METHOD: {path}.{m}")
+    except Exception as e:
+        failures.append(f"MIXIN INSPECT FAIL {path}: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 3) Smoke the ORM: every EE model query OSS code makes must build SQL
+#    without FieldError. We don't care about results -- empty is fine.
+# -------------------------------------------------------------------
+ORM_PROBES = [
+    # (label, callable returning queryset/value)
+    ("AccessControl team FK", lambda: __import__("ee.models", fromlist=["AccessControl"]).AccessControl.objects.filter(team_id=1).exists()),
+    ("AccessControl team__org traversal", lambda: __import__("ee.models", fromlist=["AccessControl"]).AccessControl.objects.filter(team__organization_id="00000000-0000-0000-0000-000000000000").exists()),
+    ("AccessControl org_member__user traversal", lambda: __import__("ee.models", fromlist=["AccessControl"]).AccessControl.objects.filter(organization_member__user_id=1).exists()),
+    ("Role.organization FK", lambda: __import__("ee.models", fromlist=["Role"]).Role.objects.filter(organization_id="00000000-0000-0000-0000-000000000000").exists()),
+    ("RoleMembership user", lambda: __import__("ee.models", fromlist=["RoleMembership"]).RoleMembership.objects.filter(user_id=1).exists()),
+    ("RoleMembership role__organization traversal", lambda: __import__("ee.models", fromlist=["RoleMembership"]).RoleMembership.objects.filter(role__organization_id="00000000-0000-0000-0000-000000000000").exists()),
+    ("DashboardPrivilege user + dashboard_id + level", lambda: list(__import__("ee.models", fromlist=["DashboardPrivilege"]).DashboardPrivilege.objects.filter(user_id=1).values_list("dashboard_id", "level"))),
+    ("License first_valid", lambda: __import__("ee.models.license", fromlist=["License"]).License.objects.first_valid()),
+]
+for label, probe in ORM_PROBES:
+    try:
+        probe()
+    except Exception as e:
+        failures.append(f"ORM PROBE FAIL {label}: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 4) Confirm User.role_memberships reverse name resolves (the exact bug
+#    that 500'd every authenticated request before fix 0046).
+# -------------------------------------------------------------------
+try:
+    from posthog.models import User
+    if not hasattr(User, "role_memberships"):
+        failures.append("REVERSE FK MISSING: User.role_memberships (RoleMembership.user.related_name)")
+except Exception as e:
+    failures.append(f"REVERSE FK CHECK FAIL: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 5) Confirm Organization.available_product_features is populated for
+#    every existing org. If empty, multi-project / advanced perms / etc.
+#    silently fail.
+# -------------------------------------------------------------------
+try:
+    from posthog.models.organization import Organization
+    bad = []
+    for org in Organization.objects.all():
+        if not org.available_product_features:
+            bad.append(f"  org {org.id} ({org.name}) has empty available_product_features")
+    if bad:
+        failures.append("ORG FEATURE BACKFILL MISSING:\n" + "\n".join(bad))
+except Exception as e:
+    failures.append(f"ORG FEATURE CHECK FAIL: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 6) URL resolver: confirm the routes the frontend depends on are wired.
+#    We don't HIT them (no auth/team in this shell), just resolve them.
+# -------------------------------------------------------------------
+try:
+    from django.urls import resolve, NoReverseMatch
+    URL_PROBES = [
+        "/api/projects/1/groups_types/",
+        "/api/projects/1/experiments/",
+        "/api/projects/1/experiment_holdouts/",
+        "/api/projects/1/experiment_saved_metrics/",
+        "/api/environments/1/conversations/",
+        "/api/environments/1/core_memory/",
+        "/api/billing/",
+        "/_preflight/",
+    ]
+    for url in URL_PROBES:
+        try:
+            resolve(url)
+        except Exception as e:
+            failures.append(f"URL PROBE FAIL {url}: {type(e).__name__}: {e}")
+except Exception as e:
+    failures.append(f"URL CHECK SETUP FAIL: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# Report
+# -------------------------------------------------------------------
+if failures:
+    print("\n" + "=" * 70)
+    print(f"FAILED: {len(failures)} smoke check(s)")
+    print("=" * 70)
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print(f"OK: all smoke checks passed ({len(EE_IMPORTS)} imports, "
+          f"{sum(len(v) for v in EXPECTED_MIXIN_METHODS.values())} mixin methods, "
+          f"{len(ORM_PROBES)} ORM probes, {1} reverse-FK check, "
+          f"1 org-feature check, 8 URL probes)")
+    sys.exit(0)
+PYEOF
