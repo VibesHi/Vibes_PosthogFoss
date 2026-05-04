@@ -66,7 +66,7 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 # you also raise `--memory` in the command override.
 x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
-x-mem-django-web: &mem-django-web  { mem_limit: 2500m,  memswap_limit: 2500m }
+x-mem-django-web: &mem-django-web  { mem_limit: 3g,     memswap_limit: 3g    }
 x-mem-django:     &mem-django      { mem_limit: 3g,     memswap_limit: 3g    }
 x-mem-django-sm:  &mem-django-sm   { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
