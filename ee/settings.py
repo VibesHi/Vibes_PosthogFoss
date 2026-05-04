@@ -30,6 +30,16 @@ one file, matching upstream layout.
 
 from posthog.settings.base_variables import DEBUG, DEMO
 from posthog.settings.utils import get_from_env, str_to_bool
+from posthog.settings.web import MIDDLEWARE as _BASE_MIDDLEWARE
+
+# Append fork-only middleware. Loaded LAST in posthog/settings/__init__.py via
+# `from ee.settings import *`, so this overrides the upstream MIDDLEWARE list
+# without touching posthog/settings/web.py.
+#
+# Order: appended at the END so it runs after upstream middlewares finished
+# building the response. Preflight middleware only mutates body bytes for
+# /_preflight, so it's safe to sit anywhere in the chain.
+MIDDLEWARE = [*_BASE_MIDDLEWARE, "ee.middleware.PreflightKafkaProbeMiddleware"]
 
 # Customer.io HTTP-API email integration. Empty -> disabled; SMTP fallback
 # in posthog/email.py still works if EMAIL_HOST is set via instance settings.
