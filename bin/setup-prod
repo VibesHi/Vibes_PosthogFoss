@@ -602,17 +602,27 @@ phase_compose_up() {
 # replicas in non-Swarm `up`, but older versions (<2.10) silently start one
 # replica regardless. Catches a lurking config bug if someone backports this
 # stack to an older Docker Engine.
+#
+# Replica counts must match docker-compose.prod.yml `deploy.replicas` blocks.
+# Update both together when scaling for higher RPS.
 phase_verify_replicas() {
-    local svc="ingestion-general" expected=2 actual
-    actual=$(dc ps --status running --format '{{.Service}}' 2>/dev/null \
-        | grep -c "^${svc}\$" || true)
-    if [ "$actual" -lt "$expected" ]; then
-        warn "Expected $expected '${svc}' replicas, got $actual."
-        warn "Check: docker compose version (need v2.10+) and 'docker compose ps ${svc}'"
-        warn "Workaround: add '--scale ${svc}=${expected}' to compose up if the deploy.replicas key isn't honored."
-    else
-        log "Replica check: ${svc}=$actual (expected $expected) ✓"
-    fi
+    local svc expected actual
+    declare -A expected_replicas=(
+        [ingestion-general]=4
+        [capture]=3
+    )
+    for svc in "${!expected_replicas[@]}"; do
+        expected="${expected_replicas[$svc]}"
+        actual=$(dc ps --status running --format '{{.Service}}' 2>/dev/null \
+            | grep -c "^${svc}\$" || true)
+        if [ "$actual" -lt "$expected" ]; then
+            warn "Expected $expected '${svc}' replicas, got $actual."
+            warn "Check: docker compose version (need v2.10+) and 'docker compose ps ${svc}'"
+            warn "Workaround: add '--scale ${svc}=${expected}' to compose up if the deploy.replicas key isn't honored."
+        else
+            log "Replica check: ${svc}=$actual (expected $expected) ✓"
+        fi
+    done
 }
 
 # ============================================================================

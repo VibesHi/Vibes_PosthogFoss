@@ -118,17 +118,56 @@ if [ "$MODE" = "cleanup" ]; then
 fi
 
 # ----- vegeta install (best-effort) -----
+# vegeta isn't in Ubuntu's main apt repos (only Debian sid). Try package
+# managers first, then fall back to GitHub release binary. Pinned version
+# avoids "latest" resolving to a future breaking release.
+install_vegeta_binary() {
+    local version="12.12.0"
+    local arch
+    case "$(uname -m)" in
+        x86_64)   arch="amd64" ;;
+        aarch64)  arch="arm64" ;;
+        arm64)    arch="arm64" ;;
+        *) die "Unsupported arch: $(uname -m)" ;;
+    esac
+    local os
+    case "$(uname -s)" in
+        Linux)  os="linux" ;;
+        Darwin) os="darwin" ;;
+        *) die "Unsupported OS: $(uname -s)" ;;
+    esac
+    local url="https://github.com/tsenart/vegeta/releases/download/v${version}/vegeta_${version}_${os}_${arch}.tar.gz"
+    log "Installing vegeta v${version} (${os}/${arch}) from GitHub releases"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    curl -fsSL "$url" -o "$tmpdir/vegeta.tar.gz" \
+        || die "Download failed: $url"
+    tar -xzf "$tmpdir/vegeta.tar.gz" -C "$tmpdir" vegeta \
+        || die "Extract failed"
+    $SUDO install -m 0755 "$tmpdir/vegeta" /usr/local/bin/vegeta \
+        || die "Install to /usr/local/bin failed"
+    rm -rf "$tmpdir"
+    log "vegeta installed: $(vegeta -version 2>&1 | head -1)"
+}
+
 if ! command -v vegeta >/dev/null 2>&1; then
     warn "vegeta not installed."
-    if command -v apt-get >/dev/null 2>&1; then
-        log "Installing via apt-get"
-        $SUDO apt-get update -qq
-        $SUDO apt-get install -y vegeta
-    elif command -v brew >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
         log "Installing via brew"
         brew install vegeta
+    elif command -v apt-get >/dev/null 2>&1; then
+        # Try apt first (Debian sid has it; Ubuntu doesn't). Fall through to
+        # binary install if apt can't find the package.
+        log "Trying apt-get install vegeta..."
+        $SUDO apt-get update -qq >/dev/null 2>&1 || true
+        if $SUDO apt-get install -y vegeta 2>/dev/null; then
+            log "vegeta installed via apt"
+        else
+            warn "vegeta not in apt repos, falling back to binary install"
+            install_vegeta_binary
+        fi
     else
-        die "Install vegeta manually: https://github.com/tsenart/vegeta/releases"
+        install_vegeta_binary
     fi
 fi
 
