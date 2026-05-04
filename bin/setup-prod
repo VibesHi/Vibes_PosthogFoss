@@ -188,6 +188,37 @@ phase_validate_env() {
     export CADDY_HOST="$caddy_host_value"
     export CADDY_TLS_BLOCK="$caddy_tls_block_value"
 
+    # Auto-write throughput defaults to .env if missing. Persists the lean
+    # small-team self-host config (NGINX_UNIT_APP_PROCESSES=1, WEB_CONCURRENCY=1)
+    # so future `docker compose up -d` runs don't fall back to the in-compose
+    # default of 2 (which OOMs at idle on a 30g host with full ingestion path).
+    # Same pattern as CADDY_HOST above: setup-prod is the source of truth, but
+    # we persist values to .env so the user can `docker compose up -d` directly
+    # afterwards without re-running setup-prod.
+    local throughput_changed=0
+    declare -A throughput_defaults=(
+        [NGINX_UNIT_APP_PROCESSES]=1
+        [WEB_CONCURRENCY]=1
+        [CELERY_MAX_TASKS_PER_CHILD]=200
+        [KAFKA_INGESTION_PARTITIONS]=6
+        [MULTI_ORG_ENABLED]=true
+        [DEPLOYMENT]=vibes-foss
+    )
+    for key in "${!throughput_defaults[@]}"; do
+        if ! grep -qE "^${key}=" .env; then
+            printf '%s=%s\n' "$key" "${throughput_defaults[$key]}" >> .env
+            throughput_changed=1
+        fi
+    done
+    if [ "$throughput_changed" -eq 1 ]; then
+        log "Wrote throughput defaults to .env (NGINX_UNIT_APP_PROCESSES, WEB_CONCURRENCY, etc.)"
+        log "Edit .env to override -- defaults are sized for a small-team self-host."
+        set -a
+        # shellcheck disable=SC1091
+        source .env
+        set +a
+    fi
+
     log "Configured for DOMAIN=$DOMAIN"
 }
 

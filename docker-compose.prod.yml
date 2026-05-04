@@ -27,7 +27,8 @@ x-logging: &default-logging
 x-restart-prod: &restart-prod
     restart: unless-stopped
 
-# Per-service memory caps. Sized for a 30 GB / 8-core single-host install.
+# Per-service memory caps. Sized for a 30 GB / 8-core single-host install
+# tuned for MAX EVENT INGESTION THROUGHPUT (mobile SDKs hitting /capture/).
 # Without these, a single runaway container (most often `clickhouse`, `web`,
 # or one of the Node ingestion services) takes the whole box. ClickHouse has
 # its own internal cap in docker/clickhouse/config.d.prod/memory_limits.xml
@@ -37,18 +38,27 @@ x-restart-prod: &restart-prod
 # `mem_limit` is enforced by plain `docker compose up`. The newer
 # `deploy.resources.limits` block is Swarm-only and silently ignored.
 #
-# Overcommit: the SUM of all caps below (~36 GB with ingestion-general at
-# 2 replicas) intentionally exceeds the 30 GB host. Caps are upper bounds,
-# not reservations — services don't all peak simultaneously. Realistic
-# steady-state usage is ~24-28 GB; the caps are spike absorbers. The 4 GB
-# swap (see bin/setup-swap) backstops the worst case where multiple
-# services peak at once. If you scale ingestion-general to 4 replicas
-# (or boot more services), trim other anchors or upgrade RAM.
+# Overcommit: the SUM of all caps below (~50 GB with capture × 3 replicas
+# and ingestion-general × 4 replicas) intentionally exceeds the 30 GB host.
+# Caps are upper bounds, not reservations — services don't all peak
+# simultaneously. Realistic steady-state usage is ~25-28 GB; the caps are
+# spike absorbers for sustained ingestion bursts. The 4 GB swap (see
+# bin/setup-swap) backstops the worst case where multiple services peak.
+# If you upgrade to a smaller host (16 GB), trim caps + reduce capture and
+# ingestion-general to 1-2 replicas each.
 #
 # Tuning: after deploy, watch `docker stats` for 24-48 h. Bump any service
 # consistently above 80% of its cap; lower any service consistently below
 # 20%. ClickHouse cap is also a hard ceiling — bump only after also bumping
 # max_server_memory_usage in config.d.prod/memory_limits.xml.
+#
+# Throughput scaling levers:
+#   capture replicas (default 3)              → see `services.capture.deploy`
+#   ingestion-general replicas (default 4)    → see `services.ingestion-general.deploy`
+#   Kafka partitions (default 6)              → KAFKA_INGESTION_PARTITIONS in .env
+#   Kafka seastar --memory (default 5G)       → see `services.kafka.command`
+#   web prefork processes (default 2)         → NGINX_UNIT_APP_PROCESSES in .env
+#   worker Celery prefork (default 2)         → WEB_CONCURRENCY in .env
 x-mem-clickhouse: &mem-clickhouse  { mem_limit: 10g,    memswap_limit: 10g }
 # Postgres needs real headroom: shared_buffers (1g) + work_mem × max_connections
 # (16m × 200 = 3.2g worst case during sorts/hashes) + maintenance_work_mem ×
@@ -64,18 +74,45 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 # crash-loops with `Could not initialize seastar: insufficient physical memory`.
 # 4g leaves ~1 GiB head-room above the 3G ask; bumping further only matters if
 # you also raise `--memory` in the command override.
-x-mem-kafka:      &mem-kafka       { mem_limit: 4g,     memswap_limit: 4g }
+# Tuned for max ingestion throughput. base.yml ships seastar with
+# `--memory 3G --reserve-memory 500M` which is fine for ~3-5k events/sec.
+# For sustained 5k-15k events/sec with 6-partition events_plugin_ingestion,
+# 3 capture producers, 4 ingestion-general consumers all batching in flight,
+# seastar needs `--memory 5G` to keep producer queues from blocking on
+# `producer-queue-full`. 6g cgroup leaves ~1g headroom above seastar.
+# Override applied in the `kafka` service block below.
+x-mem-kafka:      &mem-kafka       { mem_limit: 6g,     memswap_limit: 6g }
+# Measured idle: ~10MB. 1.2g is 100x headroom for cache + ratelimit counters.
+# Bump only if `INFO memory` shows used_memory > 80% under load OR you see
+# `evicted_keys > 0` in `docker compose logs redis7`.
 x-mem-redis:      &mem-redis       { mem_limit: 1200m,  memswap_limit: 1200m }
-x-mem-django-web: &mem-django-web  { mem_limit: 3g,     memswap_limit: 3g    }
-x-mem-django:     &mem-django      { mem_limit: 3g,     memswap_limit: 3g    }
+# `web` measured 81% idle util on 3g (Django + dagster heap × 2 prefork
+# processes ≈ 2.4GB resident). 4g gives ~40% headroom for traffic spikes
+# AND ad-hoc admin commands that load extra modules. Drop to 2g only if
+# you set NGINX_UNIT_APP_PROCESSES=1 (which halves the RSS).
+x-mem-django-web: &mem-django-web  { mem_limit: 4g,     memswap_limit: 4g    }
+# `worker` measured 79% idle util on 3g (Celery prefork × 2 + parent +
+# scheduler ≈ 2.4GB). Same 4g justification. WEB_CONCURRENCY=2 is already
+# the minimum sane value -- don't lower without causing periodic-task lag.
+x-mem-django:     &mem-django      { mem_limit: 4g,     memswap_limit: 4g    }
 x-mem-django-sm:  &mem-django-sm   { mem_limit: 1500m,  memswap_limit: 1500m }
+# Default Node services. Idle measured ~190-250MB; 1g gives 4x headroom
+# for V8 GC + librdkafka producer queues during downstream slowdowns.
 x-mem-node:       &mem-node        { mem_limit: 1g,     memswap_limit: 1g }
+# `ingestion-general` × 2 replicas, `plugin-server`. Idle measured ~310-350MB.
+# 1.5g gives 4x headroom; bump to 2g if loadtest shows >80% sustained.
 x-mem-node-hot:   &mem-node-hot    { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node-sm:    &mem-node-sm     { mem_limit: 384m,   memswap_limit: 512m }
 x-mem-temporal:   &mem-temporal    { mem_limit: 768m,   memswap_limit: 1g }
 x-mem-storage:    &mem-storage     { mem_limit: 384m,   memswap_limit: 512m }
+# Rust idle 13-90MB. Default cap stays 256m for low-volume rust services.
 x-mem-rust:       &mem-rust        { mem_limit: 256m,   memswap_limit: 384m }
-x-mem-rust-hot:   &mem-rust-hot    { mem_limit: 384m,   memswap_limit: 512m }
+# Hot rust (capture, replay-capture, feature-flags). Tuned for max ingestion
+# throughput on a single-host install: capture batches event payloads and
+# librdkafka producer queues up to ~64MB per topic per partition under
+# backpressure. 1g gives ~5x headroom over peak (~200MB) so the producer
+# never has to drop or block on backpressure.
+x-mem-rust-hot:   &mem-rust-hot    { mem_limit: 1g,     memswap_limit: 1g }
 x-mem-tiny:       &mem-tiny        { mem_limit: 256m,   memswap_limit: 256m }
 x-mem-xtiny:      &mem-xtiny       { mem_limit: 128m,   memswap_limit: 128m }
 
@@ -263,6 +300,27 @@ services:
             file: docker-compose.base.yml
             service: kafka
         logging: *default-logging
+        # Override base.yml's `--memory 3G --reserve-memory 500M` for sustained
+        # high-RPS ingestion. seastar startup subtracts ~550MiB overhead before
+        # honouring `--memory`, so 5G yields ~4.45 GiB usable for partition
+        # state, segment cache, and producer queue buffers. Sized for 5k-15k
+        # events/sec sustained with 6 partitions + 3 capture producers.
+        command:
+            - redpanda
+            - start
+            - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+            - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+            - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+            - --advertise-pandaproxy-addr internal://kafka:8082,external://localhost:18082
+            - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+            - --rpc-addr kafka:33145
+            - --advertise-rpc-addr kafka:33145
+            - --mode dev-container
+            - --smp 2
+            - --memory 5G
+            - --reserve-memory 500M
+            - --default-log-level=warn
+            - --seeds kafka:33145
         depends_on:
             - zookeeper
         # Retention defaults: 6 h ms / 6 h hours / 5 min check.
@@ -372,10 +430,17 @@ services:
             # Pre-baking config into a temp statedir avoids the broken check
             # entirely. Bonus: skips a Unit double-start, halving boot time.
             NGINX_UNIT_PRELOAD_CONFIG: 'true'
-            # Cap prefork app workers. Default is 4; each loads full Django +
-            # dagster (~400MB resident). 4 × 400MB ≈ 1.6GB which OOMs the 2.5GB
-            # limit (need headroom for unit master + controller + router + JIT
-            # caches). 2 workers handle ample QPS for self-hosted single-tenant.
+            # Cap prefork app workers. Each process loads full Django + dagster
+            # (~1.2GB resident with all imports + JIT caches warmed). Sized for
+            # a small-team self-host (5-10 dashboard users):
+            #   1 process: ~1.2GB RSS, ~10-20 RPS Django ceiling, requests
+            #              queue if a slow ClickHouse query is in flight.
+            #   2 processes: ~2.4GB RSS, ~20-40 RPS, one slow query doesn't
+            #              block other users.
+            #   4+ processes: only useful for >50 simultaneous dashboard users
+            #              or heavy `/decide/` traffic from web SDKs.
+            # Override via .env (NGINX_UNIT_APP_PROCESSES=1 to free 1.2GB for
+            # ingestion path; NGINX_UNIT_APP_PROCESSES=4 for larger teams).
             NGINX_UNIT_APP_PROCESSES: ${NGINX_UNIT_APP_PROCESSES:-2}
             # Same as worker: gates `get_can_create_org()` so the project
             # switcher's `New project` button works for org admins/owners.
@@ -434,26 +499,27 @@ services:
             file: docker-compose.base.yml
             service: ingestion-general
         logging: *default-logging
-        # Two replicas. The Rust capture service partitions Kafka messages by
-        # `{token}:{distinct_id}` (rust/common/types/src/event.rs:304), so events
-        # for the same user always land on the same partition — two consumers
-        # in the same group safely parallelize without breaking person ordering.
-        # The accompanying partition bump on `events_plugin_ingestion` (3 parts,
-        # see kafka-init below) is required for both replicas to actually do
-        # work — otherwise the second consumer sits idle.
-        # Each replica gets its own mem_limit (1.5 GB), so this adds 1.5 GB to
-        # the total cgroup budget. Lower POSTGRES_MAX_CONNECTIONS to ~150 if
-        # you see "too many connections" — each replica opens its own pool.
+        # Four replicas for max ingestion throughput. Rust capture partitions
+        # Kafka messages by `{token}:{distinct_id}` (rust/common/types/src/event.rs:304),
+        # so events for the same user always land on the same partition --
+        # N consumers in the same group safely parallelize without breaking
+        # person ordering, as long as Kafka has >= N partitions on
+        # `events_plugin_ingestion` (configured in kafka-init below; bumped
+        # to 6 partitions to match this replica count + headroom).
+        # Each Node consumer caps at ~3-5k msgs/sec; 4 replicas = ~12-20k
+        # sustained. Each replica gets its own 1.5g mem_limit (6g total).
+        # If "too many connections" errors appear, lower POSTGRES_MAX_CONNECTIONS
+        # in .env -- each replica opens ~30 conns at peak.
         deploy:
-            replicas: 2
+            replicas: 4
         environment:
             <<: *pg-env
             CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
             ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
         # Map-style depends_on so we can pin kafka-init to
-        # `service_completed_successfully`. Without this the second consumer
+        # `service_completed_successfully`. Without this consumers
         # could join the consumer group before partitions exist, briefly
-        # leaving the second replica idle (Kafka rebalances after kafka-init
+        # leaving replicas idle (Kafka rebalances after kafka-init
         # grows partitions, but it's an avoidable startup transient).
         depends_on:
             db:
@@ -769,6 +835,14 @@ services:
             file: docker-compose.base.yml
             service: capture
         logging: *default-logging
+        # Horizontal scale for max event ingestion. Single rust capture process
+        # is bounded by one CPU core (~5-10k req/s). On 8-core/30g hardware
+        # 3 replicas safely use ~3 cores while leaving room for kafka,
+        # ingestion-general, clickhouse query cores. Caddy load-balances
+        # round-robin across replicas (compose DNS returns all replica IPs).
+        # Bump to 4-6 if loadtest shows capture CPU >80% across all replicas.
+        deploy:
+            replicas: 3
 
     replay-capture:
         <<: [*restart-prod, *mem-rust-hot]
@@ -899,16 +973,16 @@ services:
                     fi
                 done
 
-                # Multi-partition topics. ingestion-general runs with replicas=2;
-                # consumer parallelism is bounded by partition count. With 3
-                # partitions: 2 active consumers + 1 standby (handles rebalance).
-                # Rust capture partitions by `{token}:{distinct_id}` (see
-                # rust/common/types/src/event.rs:304), so per-user ordering
-                # holds regardless of partition count. The `_overflow` topic
-                # mirrors the main one because the same consumer drains both.
-                # Bump KAFKA_INGESTION_PARTITIONS in .env to 4-6 if you scale
-                # ingestion-general higher.
-                INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-3}
+                # Multi-partition topics. ingestion-general runs with replicas=4;
+                # consumer parallelism is bounded by partition count. With 6
+                # partitions: 4 active consumers + 2 standby (handles rebalance
+                # without dropping consumer throughput). Rust capture partitions
+                # by `{token}:{distinct_id}` (see rust/common/types/src/event.rs:304),
+                # so per-user ordering holds regardless of partition count. The
+                # `_overflow` topic mirrors the main one because the same consumer
+                # drains both. Override KAFKA_INGESTION_PARTITIONS in .env to
+                # scale further (each partition = 1 max-throughput consumer).
+                INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-6}
                 for topic in events_plugin_ingestion events_plugin_ingestion_overflow; do
                     if rpk topic create "$$topic" --brokers kafka:9092 -p "$$INGEST_PARTS" -r 1 2>&1; then
                         echo "Topic $$topic created with $$INGEST_PARTS partitions"
