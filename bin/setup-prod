@@ -126,6 +126,59 @@ phase_validate_env() {
         warn "Copy them over and re-run."
     fi
 
+    # Caddy site/TLS config:
+    #
+    # docker-compose.base.yml's proxy service ships a `CADDYFILE:` env value
+    # that contains literal `${CADDY_HOST:-http://localhost:8000}` and
+    # `${CADDY_TLS_BLOCK:-}` references. Compose substitutes these at YAML
+    # parse time using ONLY the host-shell environment (and .env file via
+    # docker-compose's own variable substitution) -- NOT the container's
+    # `environment:` block. So even though docker-compose.prod.yml sets
+    # CADDY_HOST/CADDY_TLS_BLOCK on the proxy container at runtime, those
+    # values arrive too late: the CADDYFILE string was already baked with
+    # the fallback `http://localhost:8000` and Caddy boots with no TLS site
+    # for $DOMAIN. Symptom: TCP connects to :443 succeed, TLS handshake
+    # closes immediately ("SSL_ERROR_SYSCALL"), no Let's Encrypt cert is
+    # ever obtained (`/data/caddy/certificates/` doesn't exist).
+    #
+    # bin/deploy-hobby works around this by writing CADDY_HOST and
+    # CADDY_TLS_BLOCK directly into .env (see lines 141-142 of that script).
+    # Mirror that here: derive both from DOMAIN/TLS_BLOCK and persist them
+    # so future plain `docker compose` runs (without setup-prod) also work.
+    local caddy_host_value="${DOMAIN}, http://, https://"
+    local caddy_tls_block_value="${TLS_BLOCK:-}"
+    local caddy_env_changed=0
+
+    if ! grep -qE '^CADDY_HOST=' .env; then
+        printf 'CADDY_HOST=%s\n' "$caddy_host_value" >> .env
+        caddy_env_changed=1
+    elif [ "$(grep -E '^CADDY_HOST=' .env | head -1 | cut -d= -f2-)" != "$caddy_host_value" ]; then
+        warn "CADDY_HOST in .env doesn't match DOMAIN. Caddy will serve the .env value, not \$DOMAIN."
+        warn "  .env CADDY_HOST=$(grep -E '^CADDY_HOST=' .env | head -1 | cut -d= -f2-)"
+        warn "  derived          ${caddy_host_value}"
+        warn "Edit .env manually if this is intentional."
+    fi
+
+    if ! grep -qE '^CADDY_TLS_BLOCK=' .env; then
+        printf 'CADDY_TLS_BLOCK=%s\n' "$caddy_tls_block_value" >> .env
+        caddy_env_changed=1
+    fi
+
+    if [ "$caddy_env_changed" -eq 1 ]; then
+        log "Wrote CADDY_HOST/CADDY_TLS_BLOCK to .env (derived from DOMAIN/TLS_BLOCK)"
+        # Re-source so this run sees them too -- otherwise compose substitutes
+        # from a stale shell env even though .env on disk is now correct.
+        set -a
+        # shellcheck disable=SC1091
+        source .env
+        set +a
+    fi
+
+    # Belt-and-suspenders: export so even ad-hoc `docker compose` invocations
+    # in this same shell pick them up regardless of .env state.
+    export CADDY_HOST="$caddy_host_value"
+    export CADDY_TLS_BLOCK="$caddy_tls_block_value"
+
     log "Configured for DOMAIN=$DOMAIN"
 }
 
