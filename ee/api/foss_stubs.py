@@ -121,3 +121,77 @@ class ExperimentHoldoutsStubViewSet(_EmptyListStubViewSet):
 class ExperimentSavedMetricsStubViewSet(_EmptyListStubViewSet):
     """Stub for `/api/projects/<id>/experiment_saved_metrics/`. Same reasoning
     as ExperimentHoldoutsStubViewSet."""
+
+
+# ---------------------------------------------------------------------------
+# Group analytics (EE-gated in posthog/api/__init__.py:804)
+# ---------------------------------------------------------------------------
+
+
+class GroupsTypesStubViewSet(_EmptyListStubViewSet):
+    """Stub for `/api/projects/<id>/groups_types/`.
+
+    Frontend's `groupsModel.ts` loads this on every authenticated page mount
+    (it's a "global" kea logic, not gated by scene). Without a route the
+    kea-loaders plugin emits a "Load all group types failed: Endpoint not
+    found." toast on every navigation.
+
+    Upstream returns a FLAT array (pagination_class = None on the real
+    viewset), not a paginated envelope. Frontend code does
+    `groupTypes = response` directly, so we override list() to skip
+    EMPTY_PAGINATED. GroupTypeMapping is technically an OSS model and we
+    *could* wire a real read-only viewset, but the fork isn't shipping
+    group analytics UI, so empty list is the honest answer.
+    """
+
+    def list(self, request, *args, **kwargs) -> Response:
+        return Response([])
+
+
+# ---------------------------------------------------------------------------
+# Billing (EE-only feature; `/api/billing/` lives in `ee.billing.api` upstream)
+# ---------------------------------------------------------------------------
+
+
+class BillingStubViewSet(viewsets.ViewSet):
+    """Stub for `/api/billing/`.
+
+    Frontend's `billingLogic.tsx:loadBilling` is `lazyLoaders` -- only fires
+    when a component selecting `values.billing` mounts (Settings -> Billing,
+    org-wide usage banners). On a vanilla self-host with the synthetic
+    license, billing UI shouldn't even be reachable, but several global
+    components (e.g. usage-limit banners, organization switcher) read
+    `billing.subscription_level` defensively. A 404 there causes a kea
+    error toast.
+
+    Returns a free-tier-shaped envelope with empty product/plan arrays.
+    `parseBillingResponse` accepts `Partial<BillingType>` and dayjs-coerces
+    only what it finds, so omitted fields are fine.
+
+    Note: this is a `ViewSet` (not nested under team/org), so it's
+    registered against the root `router`, not `projects_router`.
+    """
+
+    scope_object = "INTERNAL"
+
+    def list(self, request, *args, **kwargs) -> Response:
+        return Response(
+            {
+                "available_plans": [],
+                "products": [],
+                "subscription_level": "free",
+                "has_active_subscription": False,
+                "license": None,
+                "stripe_portal_url": None,
+                "billing_period": None,
+                "current_total_amount_usd": "0.00",
+                "customer_id": None,
+            }
+        )
+
+    def update(self, request, *args, **kwargs) -> Response:
+        # Frontend tries to PATCH custom_limits_usd. No-op + return current state.
+        return self.list(request)
+
+    def partial_update(self, request, *args, **kwargs) -> Response:
+        return self.list(request)

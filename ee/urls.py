@@ -21,10 +21,12 @@ features stay disabled.
 """
 
 from ee.api.foss_stubs import (
+    BillingStubViewSet,
     CoreMemoryStubViewSet,
     ExperimentHoldoutsStubViewSet,
     ExperimentSavedMetricsStubViewSet,
     ExperimentsStubViewSet,
+    GroupsTypesStubViewSet,
     MaxConversationStubViewSet,
 )
 
@@ -37,7 +39,7 @@ def extend_api_router() -> None:
     # entire DRF route table during Django app loading, which is fragile.
     # By the time extend_api_router() is called from posthog/urls.py the
     # routers are guaranteed to exist.
-    from posthog.api import environments_router, projects_router
+    from posthog.api import environments_router, projects_router, router
 
     # IMPORTANT: registration order vs. existing `conversations/tickets` and
     # `conversations/views` (registered earlier in posthog/api/__init__.py).
@@ -88,3 +90,22 @@ def extend_api_router() -> None:
         "project_experiment_saved_metrics_stub",
         ["project_id"],
     )
+
+    # Group analytics: GroupsTypesViewSet lives behind `if EE_AVAILABLE:` in
+    # posthog/api/__init__.py:820, so it's never registered on FOSS. The
+    # frontend's `groupsModel.ts` is a global kea logic that loads on every
+    # authenticated page -> "Load all group types failed" toast on each
+    # navigation without this stub.
+    projects_router.register(
+        r"groups_types",
+        GroupsTypesStubViewSet,
+        "project_groups_types_stub",
+        ["project_id"],
+    )
+
+    # Billing: upstream `/api/billing/` is provided by `ee.billing.api`,
+    # which is stripped on the fork. `billingLogic.tsx:loadBilling` is
+    # lazy but several global components (usage-limit banners, org
+    # switcher) read `billing.subscription_level` and a 404 here causes
+    # kea error toasts. Stub returns a free-tier-shaped response.
+    router.register(r"billing", BillingStubViewSet, "billing_stub")
