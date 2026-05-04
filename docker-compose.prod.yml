@@ -311,6 +311,16 @@ services:
             # (Django ORM caches, infi.clickhouse_orm metadata, leaks in dagster/etc).
             # Without this, RSS grows to mem_limit and OOMs after ~hours of uptime.
             CELERY_MAX_TASKS_PER_CHILD: ${CELERY_MAX_TASKS_PER_CHILD:-200}
+            # Allow creating new organizations + projects on this self-host.
+            # PostHog's `get_can_create_org()` (posthog/utils.py:1119) returns
+            # False once a single org exists UNLESS this is set AND a license
+            # advertising AvailableFeature.ZAPIER is present. The fork's
+            # synthetic license (ee/models/license.py) advertises every
+            # AvailableFeature, so flipping this to true satisfies both gates.
+            # Without it, the project switcher's `New project` button stays
+            # disabled regardless of role -- the frontend conflates
+            # `can_create_org` with project creation gating.
+            MULTI_ORG_ENABLED: ${MULTI_ORG_ENABLED:-true}
         depends_on:
             db:
                 condition: service_healthy
@@ -367,6 +377,11 @@ services:
             # limit (need headroom for unit master + controller + router + JIT
             # caches). 2 workers handle ample QPS for self-hosted single-tenant.
             NGINX_UNIT_APP_PROCESSES: ${NGINX_UNIT_APP_PROCESSES:-2}
+            # Same as worker: gates `get_can_create_org()` so the project
+            # switcher's `New project` button works for org admins/owners.
+            # Must match the worker's value so periodic tasks and request
+            # handlers agree on the available-features set.
+            MULTI_ORG_ENABLED: ${MULTI_ORG_ENABLED:-true}
         depends_on:
             - db
             - redis7
