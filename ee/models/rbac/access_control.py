@@ -11,7 +11,7 @@ We need the FKs to exist on the model AND in Postgres because Django
 validates filter() kwargs against model fields BEFORE running SQL --
 omitting them turns the query into FieldError. Columns stay null forever
 on FOSS because no UI inserts AccessControl rows. See migration
-0002_accesscontrol_add_organization_member_role.py.
+0042_accesscontrol_organization_member_role.py.
 """
 
 from django.db import models

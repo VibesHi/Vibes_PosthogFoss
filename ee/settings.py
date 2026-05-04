@@ -85,3 +85,56 @@ LANGFUSE_HOST = get_from_env("LANGFUSE_HOST", "https://us.cloud.langfuse.com", t
 # those features short-circuit to either a no-op or an explicit "AI not
 # configured" error at call site.
 ANTHROPIC_API_KEY = get_from_env("ANTHROPIC_API_KEY", "")
+
+
+# === Generic fallback for `try: from ee import settings; settings.X; except ImportError` ===
+#
+# Upstream's EE-vs-FOSS gate uses two interchangeable idioms:
+#
+#     try:
+#         from ee.X import Y
+#     except ImportError:
+#         Y = ...fallback...
+#
+#     try:
+#         from ee import settings
+#         value = settings.SOME_EE_FEATURE_FLAG
+#     except ImportError:
+#         value = ...fallback...
+#
+# The first works in our fork because deleting `ee/X.py` raises ImportError.
+# The second BREAKS because we kept `ee/` as importable stubs (see
+# `ee/__init__.py` for why) -- `from ee import settings` succeeds, then
+# `settings.SOME_EE_FEATURE_FLAG` raises AttributeError, which `except
+# ImportError` doesn't catch, and the request 500s. This was the SSO+2FA
+# regression that fanned out into Load-dashboards/Load-annotations/etc errors.
+#
+# PEP 562 module __getattr__ reroutes unknown-attribute access on this module
+# to ImportError, which makes every "try: from ee import settings; settings.X;
+# except ImportError: fallback" upstream wrote work as the upstream authors
+# originally intended -- without us having to pre-declare every EE-only
+# setting upstream might add in a future sync.
+#
+# Tradeoffs:
+#   - `from ee.settings import *` (line ~123 of posthog/settings/__init__.py)
+#     uses dir()/__all__, NOT __getattr__, so the wildcard import is
+#     unaffected: only the explicitly-defined names above leak into Django
+#     settings, AUTHENTICATION_BACKENDS does NOT clobber the OSS list.
+#   - `getattr(ee.settings, "X", default)` will trigger __getattr__ instead
+#     of returning the default. Code that relies on this gets ImportError
+#     instead -- audit if you see a NEW `getattr(...)` traceback.
+#   - Typos in OUR code that look up `ee.settings.MISSPELLED` get
+#     ImportError, not AttributeError. Acceptable: the message names the
+#     missing attribute clearly.
+def __getattr__(name: str):
+    # Dunder + private leading-underscore names: real Python attribute lookup
+    # mistakes; surface as AttributeError to match builtin module behavior.
+    if name.startswith("_"):
+        raise AttributeError(name)
+    raise ImportError(
+        f"ee.settings.{name} is not declared in the FOSS stub. "
+        f"This is benign IF the calling code does `try: ...; except ImportError: ...` "
+        f"(the upstream pattern for EE-vs-FOSS gating). "
+        f"If you see this surfacing as a 500, add an `except ImportError` to the call site "
+        f"OR an explicit safe default for {name} above this __getattr__."
+    )
