@@ -32,5 +32,12 @@ fi
 
 # Host path: stream the probe over stdin so we don't depend on the file
 # being baked into the image. -T disables TTY allocation so EOF propagates.
+# DJANGO_SETTINGS_MODULE is set in docker-compose.prod.yml on the *app
+# processes* (via Unit's preload), but `docker compose exec` spawns a fresh
+# shell that inherits only the container's image-level env, so we re-set it
+# here. cwd=/code so relative imports + manage.py-style apps load.
 echo "Streaming smoke probe into web container..."
-exec docker compose exec -T web python3 - < "$PROBE"
+exec docker compose exec -T \
+    -e DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-posthog.settings}" \
+    -w /code \
+    web python3 - < "$PROBE"
