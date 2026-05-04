@@ -821,6 +821,20 @@ services:
             - temporal
 
     cyclotron-janitor:
+        # Cyclotron is PostHog's async job queue for HogHooks, pipeline
+        # destinations (Slack, BigQuery, S3 export), HogFlow workflows, and
+        # outbound webhooks. The janitor cleans completed jobs from the
+        # cyclotron_jobs table.
+        #
+        # FOSS self-host with iOS-only event capture: NOT needed. The
+        # `cyclotron_jobs` table never gets created (no migration runs for
+        # it on this fork), so the janitor spams "relation does not exist"
+        # errors every 30s. The CDP consumers in `plugins` keep running but
+        # no-op without destinations configured.
+        #
+        # Enable with: docker compose --profile cdp up -d
+        # Or: COMPOSE_PROFILES=cdp docker compose up -d
+        profiles: [cdp]
         <<: [*restart-prod, *mem-rust]
         image: posthog-cyclotron-janitor
         extends:
@@ -913,6 +927,23 @@ services:
             - redis7
 
     hypercache-server:
+        # Caches /surveys/* (Surveys product) and /array/* (web SDK init +
+        # remote config). Required for posthog-js web SDK clients to
+        # initialize. iOS-only setups don't need this, but enabling by
+        # default since `web-sdk` is the most common addition to a
+        # mobile-first PostHog deploy.
+        #
+        # S3 wiring: hypercache fetches project config blobs from object
+        # storage. Without OBJECT_STORAGE_ENDPOINT pointing at the local
+        # `objectstorage` (MinIO) service, the AWS S3 SDK default-routes
+        # to public AWS S3 and logs `S3(OperationFailed: dispatch failure)`.
+        # The fallback to direct DB lookup works, so feature flags still
+        # function, but it pollutes logs and makes /decide slower.
+        #
+        # OBJECT_STORAGE_BUCKET defaults to 'posthog' inside the rust
+        # service (rust/hypercache-server/src/config.rs:50). Make sure the
+        # bucket exists in MinIO -- it's auto-created on first write by the
+        # Django web service (see posthog/storage/object_storage.py).
         <<: [*restart-prod, *mem-rust]
         image: posthog-hypercache-server
         build:
@@ -921,8 +952,18 @@ services:
             file: docker-compose.base.yml
             service: hypercache-server
         logging: *default-logging
+        environment:
+            OBJECT_STORAGE_ENDPOINT: 'http://objectstorage:19000'
+            OBJECT_STORAGE_BUCKET: 'posthog'
+            OBJECT_STORAGE_REGION: 'us-east-1'
+            # AWS SDK reads creds from these standard env vars. Match the
+            # MinIO root user/password configured on the objectstorage
+            # service block below.
+            AWS_ACCESS_KEY_ID: 'object_storage_root_user'
+            AWS_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
         depends_on:
             - redis7
+            - objectstorage
 
     kafka-init:
         <<: *mem-tiny
