@@ -203,6 +203,11 @@ phase_validate_env() {
         [KAFKA_INGESTION_PARTITIONS]=6
         [MULTI_ORG_ENABLED]=true
         [DEPLOYMENT]=vibes-foss
+        # Query perf -- forces person_on_events_mode to the fast
+        # (read-from-events) variant. Without this, teams fall through to
+        # JOIN-mode in posthog/models/team/team.py and every WebAnalytics /
+        # Trends / Retention query is 5-30x slower. See .env.example.prod.
+        [PERSON_ON_EVENTS_V2_OVERRIDE]=True
     )
     for key in "${!throughput_defaults[@]}"; do
         if ! grep -qE "^${key}=" .env; then
