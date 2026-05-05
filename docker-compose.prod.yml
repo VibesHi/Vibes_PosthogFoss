@@ -38,8 +38,8 @@ x-restart-prod: &restart-prod
 # `mem_limit` is enforced by plain `docker compose up`. The newer
 # `deploy.resources.limits` block is Swarm-only and silently ignored.
 #
-# Overcommit: the SUM of all caps below (~50 GB with capture × 3 replicas
-# and ingestion-general × 4 replicas) intentionally exceeds the 30 GB host.
+# Overcommit: the SUM of all caps below (~53 GB with capture × 3 replicas
+# and ingestion-general × 6 replicas) intentionally exceeds the 30 GB host.
 # Caps are upper bounds, not reservations — services don't all peak
 # simultaneously. Realistic steady-state usage is ~25-28 GB; the caps are
 # spike absorbers for sustained ingestion bursts. The 4 GB swap (see
@@ -54,7 +54,7 @@ x-restart-prod: &restart-prod
 #
 # Throughput scaling levers:
 #   capture replicas (default 3)              → see `services.capture.deploy`
-#   ingestion-general replicas (default 4)    → see `services.ingestion-general.deploy`
+#   ingestion-general replicas (default 6)    → see `services.ingestion-general.deploy`
 #   Kafka partitions (default 6)              → KAFKA_INGESTION_PARTITIONS in .env
 #   Kafka seastar --memory (default 5G)       → see `services.kafka.command`
 #   web prefork processes (default 2)         → NGINX_UNIT_APP_PROCESSES in .env
@@ -77,7 +77,7 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 # Tuned for max ingestion throughput. base.yml ships seastar with
 # `--memory 3G --reserve-memory 500M` which is fine for ~3-5k events/sec.
 # For sustained 5k-15k events/sec with 6-partition events_plugin_ingestion,
-# 3 capture producers, 4 ingestion-general consumers all batching in flight,
+# 3 capture producers, 6 ingestion-general consumers all batching in flight,
 # seastar needs `--memory 5G` to keep producer queues from blocking on
 # `producer-queue-full`. 6g cgroup leaves ~1g headroom above seastar.
 # Override applied in the `kafka` service block below.
@@ -516,19 +516,34 @@ services:
             file: docker-compose.base.yml
             service: ingestion-general
         logging: *default-logging
-        # Four replicas for max ingestion throughput. Rust capture partitions
+        # Six replicas for max ingestion throughput. Rust capture partitions
         # Kafka messages by `{token}:{distinct_id}` (rust/common/types/src/event.rs:304),
         # so events for the same user always land on the same partition --
         # N consumers in the same group safely parallelize without breaking
         # person ordering, as long as Kafka has >= N partitions on
-        # `events_plugin_ingestion` (configured in kafka-init below; bumped
-        # to 6 partitions to match this replica count + headroom).
-        # Each Node consumer caps at ~3-5k msgs/sec; 4 replicas = ~12-20k
-        # sustained. Each replica gets its own 1.5g mem_limit (6g total).
+        # `events_plugin_ingestion` (configured in kafka-init below; both
+        # `events_plugin_ingestion` and `events_plugin_ingestion_historical`
+        # are sized to 6 partitions, so 6 replicas = exactly 1 partition each
+        # under cooperative-sticky assignment).
+        #
+        # Empirical per-replica ceiling on this 8-core / 30G host with PostHog
+        # 1.x ingestion-v2 + personless mode + GeoIP transformation disabled:
+        # ~1k events/sec. 6 replicas = ~6k/sec sustained aggregate consume.
+        # See ee/scripts/mixpanel_import/RUNBOOK.md for the migration tuning
+        # path (Phases 2.1, 2.2) that gets to this rate.
+        #
+        # Going beyond 6 requires also expanding partitions on the historical
+        # topic (rpk topic alter-config ... --set-partitions N, irreversible)
+        # AND ~1.5 cores per extra replica, which this 8-core box does not
+        # have headroom for. 12 replicas would push peak load avg to ~15+
+        # and oversubscribe by ~90%, hurting throughput more than it helps.
+        # See `top` and `uptime` during peak ingestion before raising further.
+        #
+        # Each replica gets its own 1.5g mem_limit (6 × 1.5 = 9g total).
         # If "too many connections" errors appear, lower POSTGRES_MAX_CONNECTIONS
-        # in .env -- each replica opens ~30 conns at peak.
+        # in .env -- each replica opens ~30 conns at peak (6 × 30 = 180 conns).
         deploy:
-            replicas: 4
+            replicas: 6
         environment:
             <<: *pg-env
             CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
@@ -1046,10 +1061,10 @@ services:
                     fi
                 done
 
-                # Multi-partition topics. ingestion-general runs with replicas=4;
+                # Multi-partition topics. ingestion-general runs with replicas=6;
                 # consumer parallelism is bounded by partition count. With 6
-                # partitions: 4 active consumers + 2 standby (handles rebalance
-                # without dropping consumer throughput). Rust capture partitions
+                # partitions and 6 replicas: 1 partition per consumer, no
+                # imbalance under cooperative-sticky assignment. Rust capture partitions
                 # by `{token}:{distinct_id}` (see rust/common/types/src/event.rs:304),
                 # so per-user ordering holds regardless of partition count. The
                 # `_overflow` topic mirrors the main one because the same consumer
