@@ -116,6 +116,92 @@ worker leasing jobs from posthog_batchimport
 The worker polls Postgres every few seconds for unleased jobs. With no
 jobs in the table yet, it sits idle — that's correct.
 
+### 2.1 Enable personless mode for the team (highly recommended)
+
+Historical Mixpanel events go through the same `ingestion-general` consumer
+as live SDK traffic. By default, the consumer does full person processing
+for every event (PG lookup, person upsert, person Kafka updates). On a one-
+shot bulk import this is the dominant per-event CPU cost — empirically
+~3–10x slower than ingestion with person processing skipped.
+
+PostHog has a first-class flag for this: `Team.person_processing_opt_out`.
+When ON, the consumer auto-injects `$process_person_profile=false` into
+every event for that team and skips the entire person path. Events still
+get a deterministic `person_id` (UUIDv5 from `team_id:distinct_id`) so
+unique-user counts, funnels, retention all work. See
+`docs/published/handbook/engineering/person-processing.md` for details.
+
+Caveats — what you lose while it's ON:
+- No `posthog_person` rows created for new distinct_ids
+- No person properties (`$set`, `$set_once`, `$unset` are dropped)
+- `$identify`/`$create_alias`/`$merge_dangerously`/`$groupidentify`
+  events get **dropped** with `invalid_event_when_process_person_profile_is_false`
+  (Mixpanel doesn't normally emit these)
+- Cohorts that depend on person properties imported only via this backfill
+  won't have data. Cohorts on event properties are unaffected.
+
+What you keep:
+- All event rows in ClickHouse, fully queryable
+- Counting unique users, funnels, retention, lifecycle, paths
+- Filter/breakdown by event properties (incl. `$os`, `$city`, etc.)
+- Filter/breakdown by `person.properties.X` for properties that came on
+  the event (Persons-on-Events / PoE)
+- Linking on next live `$identify`: when the user comes back online and
+  the SDK fires `$identify`, an override is created that retroactively
+  links all their personless historical events to the new person record
+
+Toggle helper (idempotent, prints state before/after, restarts the
+consumer so the team-cache reloads immediately):
+
+```bash
+# Dry: just show current value
+./ee/scripts/mixpanel_import/personless_mode.sh status "$POSTHOG_TEAM_ID"
+
+# Turn on — DO THIS BEFORE the first job is leased so all events skip
+./ee/scripts/mixpanel_import/personless_mode.sh on "$POSTHOG_TEAM_ID"
+```
+
+Verify it's working: open the migration team in the PostHog UI →
+Persons. The person count should NOT grow while imports run. If it does,
+team-config cache hasn't reloaded — re-run the script or restart
+ingestion-general manually.
+
+You'll turn it OFF in Phase 5 before pointing live SDKs at this instance.
+
+### 2.2 Disable hog function transformations (incl. GeoIP)
+
+PostHog auto-creates an enabled GeoIP transformation hog function for every
+new team (`posthog/models/hog_functions/hog_function.py:304`). It runs in
+the same `ingestion-general` consumer as event processing — for every
+event, it spins up a hog VM, executes the transformation code, and
+short-circuits if the event has no `$ip`.
+
+The Rust Mixpanel parser doesn't emit `$ip`
+(`rust/batch-import-worker/src/parse/content/amplitude.rs:434` only the
+Amplitude parser does), so the GeoIP transformation is a per-event no-op
+during this migration — but the hog VM invocation overhead (~0.5–2ms/event)
+is still real. Disabling it gives roughly a 1.5–2x speedup on top of
+personless mode.
+
+The transformer service short-circuits before invoking any hog VM if the
+team has zero enabled transformations:
+`nodejs/src/cdp/hog-transformations/hog-transformer.service.ts:183`.
+
+Toggle helper (idempotent, snapshots which IDs were enabled so `on` only
+re-enables exactly those):
+
+```bash
+# Show current state (read-only)
+./ee/scripts/mixpanel_import/transformations_mode.sh status "$POSTHOG_TEAM_ID"
+
+# Disable all enabled transformations for the team — saves IDs to
+# /var/tmp/posthog-mixpanel-import/team-${id}-disabled-transformations.txt
+./ee/scripts/mixpanel_import/transformations_mode.sh off "$POSTHOG_TEAM_ID"
+```
+
+Do this BEFORE the first batch import job is leased so the consumer rate
+applies to the whole run. You'll re-enable in Phase 5.
+
 ## Phase 3 — Pilot with one day
 
 ### 3.1 Create the BatchImport row
@@ -280,6 +366,19 @@ WHERE id = '<uuid>';
 ## Phase 5 — Cleanup
 
 ```bash
+# Re-enable hog function transformations (incl. GeoIP) for the team.
+# REQUIRED if you ran Phase 2.2 — otherwise live SDK events skip
+# transformations forever. Reads IDs from
+# /var/tmp/posthog-mixpanel-import/team-${id}-disabled-transformations.txt
+# and re-enables exactly those (won't accidentally enable transforms the
+# operator had disabled for unrelated reasons).
+./ee/scripts/mixpanel_import/transformations_mode.sh on "$POSTHOG_TEAM_ID"
+
+# Turn personless mode OFF before pointing live SDKs at this instance.
+# REQUIRED if you enabled it in Phase 2.1 — otherwise live traffic also
+# skips person processing.
+./ee/scripts/mixpanel_import/personless_mode.sh off "$POSTHOG_TEAM_ID"
+
 # Stop the worker
 docker compose -f docker-compose.prod.yml --profile migration down batch-import-worker
 
