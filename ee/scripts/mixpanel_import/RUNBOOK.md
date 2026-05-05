@@ -396,6 +396,69 @@ gsutil -m rm 'gs://posthog-helper-bucket/events_*.jsonl'
 # gsutil -m rm -r gs://posthog-helper-bucket/mixpanel-daily/
 ```
 
+## Phase 6 — (Optional) Backfill Person profiles for personless events
+
+Background: in Phase 2.1 you flipped `Team.person_processing_opt_out=TRUE`,
+so all imported events landed without `posthog_person` rows. Each event got
+a deterministic `person_id = uuidFromDistinctId(team_id:distinct_id)` in
+ClickHouse — analytics work fine, but the Persons tab is empty for users
+who don't return live.
+
+Two options:
+1. **Wait for live traffic.** When a user comes back online, your live SDK
+   fires `$identify` with their distinct_id, the ingestion pipeline creates
+   the Person record, and (because we used the SAME deterministic UUID
+   during personless ingestion) every prior event automatically links to
+   the new Person — no override needed. Best for active user bases.
+2. **Proactively backfill from imported events.** For users who churned
+   and won't return, lift their identity properties off the imported
+   events directly. Run `backfill_person_profiles.py`.
+
+The backfill script:
+- Aggregates per-distinct-id property snapshots from CH `events`
+  (`argMax(prop, timestamp)` for each whitelisted key)
+- Computes the same `uuidFromDistinctId(team_id, distinct_id)` the
+  ingestion pipeline used during personless mode
+- Inserts `posthog_person` + `posthog_persondistinctid` in PG and writes
+  the matching CH rows via `KAFKA_PERSON` / `KAFKA_PERSON_DISTINCT_ID`
+- Idempotent: re-running skips distinct_ids that already have a Person row
+- Optional `--dry-run` shows the CH query and a sample of what would be
+  inserted without writing
+
+Run from the prod host AFTER Phase 5 (personless mode flipped off):
+
+```bash
+# Dry run first — see how many distinct_ids the script would create
+docker compose -f docker-compose.prod.yml exec -T \
+    -e POSTHOG_TEAM_ID="$POSTHOG_TEAM_ID" web \
+    python -m ee.scripts.mixpanel_import.backfill_person_profiles \
+        --since 2024-02-01 --until 2026-05-01 --dry-run
+
+# Real run — pick a sensible batch size (1000 is reasonable; bigger
+# batches put more pressure on the CH person inserts)
+docker compose -f docker-compose.prod.yml exec -T \
+    -e POSTHOG_TEAM_ID="$POSTHOG_TEAM_ID" web \
+    python -m ee.scripts.mixpanel_import.backfill_person_profiles \
+        --since 2024-02-01 --until 2026-05-01 --batch-size 1000
+```
+
+Tunable knobs (see `--help`): `--min-event-count` to skip ultra-low-signal
+distinct_ids; `--limit` for incremental runs; `--since`/`--until` to chunk
+by quarter if the CH aggregation is slow.
+
+Properties lifted onto the Person profile (whitelist, see
+`PERSON_PROPERTY_KEYS` in the script): `email`, `$email`, `name`, `$name`,
+`$user_id`, `$device_id`, `$os`, `$os_version`, `$browser`,
+`$browser_version`, `$device_type`, `$app_version_string`, `$city`,
+`$region`, `mp_country_code`, `plan`, `subscription_tier`, plus a few
+others. Edit the list in the script if you need additional Mixpanel-native
+properties.
+
+**No `person_distinct_id_overrides` rows are created** because the script
+reuses the same deterministic UUIDv5 the imported events already reference
+— event rows in CH need no rewriting. This is also why this script is
+purely additive and safe to run repeatedly.
+
 ## What this DOESN'T do
 
 1. **Person merging across anon → identified.** The dataset is already 99.88%
