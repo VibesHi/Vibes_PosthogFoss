@@ -208,6 +208,13 @@ phase_validate_env() {
         # JOIN-mode in posthog/models/team/team.py and every WebAnalytics /
         # Trends / Retention query is 5-30x slower. See .env.example.prod.
         [PERSON_ON_EVENTS_V2_OVERRIDE]=True
+        # Frontend feature flags (force-enabled via appContext). Upstream-supported
+        # PERSISTED_FEATURE_FLAGS env var. `web-analytics-for-mobile` switches
+        # WebAnalytics graphs/Paths from $pageview to $screen events -- required
+        # for mobile-only installs (otherwise Unique Visitors graph + Paths tile
+        # stay empty even when $screen events are abundant). See .env.example.prod
+        # for more flags worth enabling.
+        [PERSISTED_FEATURE_FLAGS]=web-analytics-for-mobile
     )
     for key in "${!throughput_defaults[@]}"; do
         if ! grep -qE "^${key}=" .env; then
