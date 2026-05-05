@@ -48,25 +48,48 @@ fi
 
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
-# Sum CURRENT-OFFSET across all partitions for a group. Skips rows with "-".
+# rpk group describe output schema (column count varies across versions):
+#
+#  older rpk:  TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG MEMBER-ID ...
+#  newer rpk:  TOPIC PARTITION CURRENT-OFFSET LOG-START-OFFSET LOG-END-OFFSET LAG MEMBER-ID ...
+#
+# Both share the same header keywords, so we LOCATE the column by header name
+# rather than hardcoding $3 / $5 / $6. CURRENT-OFFSET is the "consumed up to"
+# offset (used to compute msg/sec); LAG is the unconsumed-message count.
+
 sum_offsets() {
     dc exec -T "$KAFKA_SERVICE" rpk group describe "$1" 2>/dev/null \
         | awk '
-            BEGIN { in_t=0; t=0 }
-            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ { in_t=1; next }
-            in_t && $3 ~ /^[0-9]+$/ { t += $3 }
+            BEGIN { in_t=0; cur_col=0; t=0 }
+            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
+                in_t=1
+                for (i=1; i<=NF; i++) if ($i == "CURRENT-OFFSET") cur_col=i
+                next
+            }
+            in_t && cur_col > 0 && $cur_col ~ /^[0-9]+$/ { t += $cur_col }
             END { print t+0 }
         '
 }
 
 sum_lag() {
-    dc exec -T "$KAFKA_SERVICE" rpk group describe "$1" 2>/dev/null \
-        | awk '
-            BEGIN { in_t=0; t=0 }
-            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ { in_t=1; next }
-            in_t && NF >= 5 && $5 ~ /^[0-9]+$/ { t += $5 }
+    # Prefer the header TOTAL-LAG line if present (rpk prints it in the
+    # summary block), else dynamically locate the LAG column.
+    local out total
+    out=$(dc exec -T "$KAFKA_SERVICE" rpk group describe "$1" 2>/dev/null || true)
+    total=$(printf '%s\n' "$out" | awk '/^TOTAL-LAG[[:space:]]/ { print $2; exit }')
+    if [ -z "$total" ] || [ "$total" = "-" ]; then
+        total=$(printf '%s\n' "$out" | awk '
+            BEGIN { in_t=0; lag_col=0; t=0 }
+            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
+                in_t=1
+                for (i=1; i<=NF; i++) if ($i == "LAG") lag_col=i
+                next
+            }
+            in_t && lag_col > 0 && $lag_col ~ /^[0-9]+$/ { t += $lag_col }
             END { print t+0 }
-        '
+        ')
+    fi
+    echo "${total:-0}"
 }
 
 if [ -t 1 ]; then

@@ -102,7 +102,11 @@ dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 # ------------- 1-3. Kafka lag checks -------------
 
 # rpk group describe prints `TOTAL-LAG <n>` in the header and a per-partition
-# table. We try the header first, then fall back to summing column 5 (LAG).
+# table. We try the header first, then fall back to summing the LAG column.
+#
+# Column index for LAG varies across rpk versions (older = 5, newer = 6 because
+# of an inserted LOG-START-OFFSET), so locate it dynamically by header name
+# instead of hardcoding.
 total_lag_for_group() {
     local group=$1
     local out total
@@ -113,11 +117,14 @@ total_lag_for_group() {
     fi
     total=$(awk '/^TOTAL-LAG[[:space:]]/ {print $2; exit}' <<<"$out")
     if [[ -z "$total" || "$total" == "-" ]]; then
-        # Fallback: sum LAG column from the per-partition table.
         total=$(awk '
-            BEGIN { in_table=0; t=0 }
-            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ { in_table=1; next }
-            in_table && NF >= 5 && $5 ~ /^[0-9]+$/ { t += $5 }
+            BEGIN { in_table=0; lag_col=0; t=0 }
+            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
+                in_table=1
+                for (i=1; i<=NF; i++) if ($i == "LAG") lag_col=i
+                next
+            }
+            in_table && lag_col > 0 && $lag_col ~ /^[0-9]+$/ { t += $lag_col }
             END { print t+0 }
         ' <<<"$out")
     fi
