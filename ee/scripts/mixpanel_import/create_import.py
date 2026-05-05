@@ -25,12 +25,14 @@ into shell history and `ps` output). Set them on the host BEFORE the
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 import sys
 from typing import Any
 
-logger = logging.getLogger(__name__)
+# NOTE: We deliberately don't use the `logging` module for operator output here —
+# Django's structlog config takes over the root logger during `django.setup()`,
+# so anything written via `logger.info(...)` from this script gets swallowed.
+# All operator-facing output goes through print() instead.
 
 
 REQUIRED_ENV = (
@@ -55,7 +57,8 @@ DEFAULTS = {
 def _env(name: str, default: str | None = None) -> str:
     value = os.environ.get(name, default)
     if value is None:
-        logger.error("missing required env var: %s", name)
+        # print() not logger — see DRY RUN comment in main() for why.
+        print(f"ERROR: missing required env var: {name}", file=sys.stderr)
         sys.exit(2)
     return value
 
@@ -105,12 +108,10 @@ def build_secrets(access_key_id: str, secret_access_key: str) -> dict[str, str]:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
     # Validate required env up front. Bail early so we don't half-create rows.
     for var in REQUIRED_ENV:
         if not os.environ.get(var):
-            logger.error("missing required env var: %s", var)
+            print(f"ERROR: missing required env var: {var}", file=sys.stderr)
             sys.exit(2)
 
     parser = argparse.ArgumentParser(
@@ -188,7 +189,7 @@ def main() -> None:
     try:
         team = Team.objects.get(pk=args.team_id)
     except Team.DoesNotExist:
-        logger.error("team_id=%s does not exist", args.team_id)
+        print(f"ERROR: team_id={args.team_id} does not exist", file=sys.stderr)
         sys.exit(3)
 
     import_config = build_import_config(args)
@@ -201,10 +202,14 @@ def main() -> None:
         import json
 
         masked = {**secrets, "aws_secret_access_key": "***REDACTED***"}
-        logger.info("DRY RUN - would create BatchImport with:")
-        logger.info("  team_id=%s name=%s", team.id, team.name)
-        logger.info("  import_config=%s", json.dumps(import_config, indent=2))
-        logger.info("  secrets=%s", json.dumps(masked, indent=2))
+        # NOTE: print() not logger.info — Django's structlog already configured the
+        # root logger by the time we get here, so logging.basicConfig() above is a
+        # no-op and our INFO logs would never reach stdout. Operator output goes
+        # via print() to dodge that bootstrap order.
+        print("DRY RUN - would create BatchImport with:")
+        print(f"  team_id={team.id} name={team.name}")
+        print(f"  import_config={json.dumps(import_config, indent=2)}")
+        print(f"  secrets={json.dumps(masked, indent=2)}")
         return
 
     # NOTE: We bypass the BatchImportConfigBuilder to write the JSON directly
@@ -220,9 +225,9 @@ def main() -> None:
     )
     bi.save()
 
-    logger.info("created BatchImport id=%s team_id=%s status=%s", bi.id, bi.team_id, bi.status)
-    logger.info("monitor with:")
-    logger.info(
+    print(f"created BatchImport id={bi.id} team_id={bi.team_id} status={bi.status}")
+    print("monitor with:")
+    print(
         "  docker compose exec db psql -U posthog -d posthog -c "
         '"SELECT id, status, leased_until, backoff_attempt, '
         "left(coalesce(status_message,''), 200) as status_message, "
