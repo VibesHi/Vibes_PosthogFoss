@@ -379,6 +379,13 @@ services:
             # disabled regardless of role -- the frontend conflates
             # `can_create_org` with project creation gating.
             MULTI_ORG_ENABLED: ${MULTI_ORG_ENABLED:-true}
+            # Force-enable frontend feature flags without a real flag service.
+            # Read by posthog/settings/feature_flags.py and surfaced into the
+            # frontend appContext via posthog/utils.py — values land in
+            # window.POSTHOG_APP_CONTEXT.persisted_feature_flags. `.env` keys
+            # only reach the container when explicitly forwarded here (compose
+            # `.env` is for YAML interpolation, not auto-injection).
+            PERSISTED_FEATURE_FLAGS: ${PERSISTED_FEATURE_FLAGS:-web-analytics-for-mobile}
         depends_on:
             db:
                 condition: service_healthy
@@ -447,6 +454,10 @@ services:
             # Must match the worker's value so periodic tasks and request
             # handlers agree on the available-features set.
             MULTI_ORG_ENABLED: ${MULTI_ORG_ENABLED:-true}
+            # See worker.environment.PERSISTED_FEATURE_FLAGS — the web service
+            # is the one that actually renders appContext, so this is the
+            # critical injection point. Worker mirrors it for consistency.
+            PERSISTED_FEATURE_FLAGS: ${PERSISTED_FEATURE_FLAGS:-web-analytics-for-mobile}
         depends_on:
             - db
             - redis7
