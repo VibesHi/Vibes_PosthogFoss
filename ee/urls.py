@@ -28,6 +28,7 @@ from ee.api.foss_stubs import (
     ExperimentsStubViewSet,
     GroupsTypesStubViewSet,
     MaxConversationStubViewSet,
+    SubscriptionsStubViewSet,
 )
 
 urlpatterns: list = []
@@ -63,6 +64,18 @@ def extend_api_router() -> None:
         r"core_memory",
         CoreMemoryStubViewSet,
         "environment_core_memory_stub",
+        ["team_id"],
+    )
+
+    # Subscriptions: scheduled email/Slack/webhook deliveries of dashboards
+    # and insights. Real impl lives in `ee/api/subscription.py` upstream
+    # (stripped on this fork). The bell-icon count badge in
+    # SceneSubscribeButton is rendered on every dashboard/insight, mounting
+    # subscriptionsLogic -> "Load subscriptions failed" toast without this.
+    environments_router.register(
+        r"subscriptions",
+        SubscriptionsStubViewSet,
+        "environment_subscriptions_stub",
         ["team_id"],
     )
 

@@ -225,6 +225,7 @@ try:
         "/api/projects/1/experiment_saved_metrics/",
         "/api/environments/1/conversations/",
         "/api/environments/1/core_memory/",
+        "/api/environments/1/subscriptions/",
         "/api/billing/",
         "/_preflight/",
     ]

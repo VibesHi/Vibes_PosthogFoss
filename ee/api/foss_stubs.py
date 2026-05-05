@@ -149,6 +149,36 @@ class GroupsTypesStubViewSet(_EmptyListStubViewSet):
 
 
 # ---------------------------------------------------------------------------
+# Subscriptions (EE-only; `ee/api/subscription.py` + `ee/models/subscription.py`
+# stripped on this fork. Whole feature relies on Celery scheduled deliveries
+# via `ee/tasks/subscriptions/*` that have no model to read from anymore.)
+# ---------------------------------------------------------------------------
+
+
+class SubscriptionsStubViewSet(_EmptyListStubViewSet):
+    """Stub for `/api/environments/<id>/subscriptions/`.
+
+    Frontend's `subscriptionsLogic.ts:loadSubscriptions` fires from
+    `SceneSubscribeButton` on every dashboard + insight scene mount because
+    `hasSubscriptionsFeature` is always true on this fork (the synthetic
+    license in `ee/models/license.py` advertises every `AvailableFeature`,
+    including `SUBSCRIPTIONS`). Without this stub, every dashboard/insight
+    page opens with a "Load subscriptions failed: Endpoint not found." toast.
+
+    Returning an empty paginated envelope makes the bell icon's count badge
+    render as 0 (`showZero={false}` hides it entirely) and the
+    `ManageSubscriptions` view fall back to its empty-state CTA.
+
+    Writes (POST/PATCH/DELETE) are intentionally NOT stubbed -- there's no
+    Subscription model to persist to. Clicking "New subscription" hits
+    POST and gets 405; the form's `submitSubscriptionFailure` listener
+    surfaces the API error in `lemonToast.error` instead of silently
+    pretending to save. Acceptable because there is no UI gate hiding the
+    feature from users (the synthetic license unlocks it everywhere).
+    """
+
+
+# ---------------------------------------------------------------------------
 # Billing (EE-only feature; `/api/billing/` lives in `ee.billing.api` upstream)
 # ---------------------------------------------------------------------------
 
