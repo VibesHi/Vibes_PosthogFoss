@@ -528,7 +528,11 @@ services:
         #
         # Empirical per-replica ceiling on this 8-core / 30G host with PostHog
         # 1.x ingestion-v2 + personless mode + GeoIP transformation disabled:
-        # ~1k events/sec. 6 replicas = ~6k/sec sustained aggregate consume.
+        # ~1k events/sec at default CONSUMER_MAX_BACKGROUND_TASKS=1 (foreground
+        # processing serialized behind the previous batch's Kafka produce flush).
+        # With CONSUMER_MAX_BACKGROUND_TASKS=4 + CONSUMER_BATCH_SIZE=2000 (set
+        # below), this rises to ~3-4k/sec per replica -- aggregate ~15-20k/sec
+        # across 6 replicas, until CH/PG become the new bottleneck.
         # See ee/scripts/mixpanel_import/RUNBOOK.md for the migration tuning
         # path (Phases 2.1, 2.2) that gets to this rate.
         #
@@ -548,6 +552,25 @@ services:
             <<: *pg-env
             CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
             ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            # Pipeline N batches' Kafka produce-flushes concurrently per consumer.
+            # The "background task" wraps `awaitScheduledWork` -- waiting for all
+            # produces (clickhouse_events_json, clickhouse_person, etc.) to ack.
+            # Default 1 (nodejs/src/common/config.ts) means each poll() blocks on
+            # the previous batch's full produce-flush before processing the next
+            # batch -- per-consumer ceiling ~= CONSUMER_BATCH_SIZE / (fgMs + kafkaFlushMs).
+            # With 4, foreground processing of batch N+1 can start while produces
+            # for batches N, N-1, N-2 are still in flight. Expected 2-3x throughput.
+            # Risk: at-least-once redelivery on crash up to 4 * CONSUMER_BATCH_SIZE
+            # events (offset commit waits for all in-flight batches in-order, see
+            # nodejs/src/kafka/consumer.ts:760-778). Safe for the Mixpanel import
+            # because every event has a deterministic $insert_id and we land on
+            # ReplacingMergeTree (sharded_events) which dedupes on the UUID.
+            CONSUMER_MAX_BACKGROUND_TASKS: 4
+            # Bigger Kafka poll batches amortize the per-flush overhead. Doubles
+            # memory per replica (~6MB extra at 2000 msgs * 3KB avg) -- negligible
+            # vs the 1.5G mem_limit. Going much higher hurts because the foreground
+            # `flushBatchStoresStep` blocks the pipeline until done.
+            CONSUMER_BATCH_SIZE: 2000
         # Map-style depends_on so we can pin kafka-init to
         # `service_completed_successfully`. Without this consumers
         # could join the consumer group before partitions exist, briefly
