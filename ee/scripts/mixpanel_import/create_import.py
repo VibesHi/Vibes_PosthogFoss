@@ -46,7 +46,11 @@ DEFAULTS = {
     "GCS_PREFIX": "mixpanel-daily/",
     "GCS_REGION": "auto",
     "GCS_ENDPOINT_URL": "https://storage.googleapis.com",
-    "KAFKA_HISTORICAL_TOPIC": "events_plugin_ingestion_historical",
+    # The Rust worker treats `sink.topic` as a logical alias, not the actual
+    # Kafka topic name. Valid values: "main", "historical", "overflow". They
+    # resolve via KAFKA_TOPIC_MAIN / KAFKA_TOPIC_HISTORICAL / KAFKA_TOPIC_OVERFLOW
+    # env vars on the worker (set in docker-compose.prod.yml).
+    "KAFKA_TOPIC_ALIAS": "historical",
     "KAFKA_SEND_RATE": "20000",
     "KAFKA_TXN_TIMEOUT_S": "60",
     "MIXPANEL_TIMESTAMP_OFFSET_SECONDS": "0",
@@ -147,8 +151,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--kafka-topic",
-        default=_env("KAFKA_HISTORICAL_TOPIC", DEFAULTS["KAFKA_HISTORICAL_TOPIC"]),
-        help="Kafka topic to emit events to (worker's historical alias resolves to this name by default)",
+        default=_env("KAFKA_TOPIC_ALIAS", DEFAULTS["KAFKA_TOPIC_ALIAS"]),
+        choices=("main", "historical", "overflow"),
+        help="Logical Kafka topic alias resolved by the worker via KAFKA_TOPIC_* env",
     )
     parser.add_argument(
         "--kafka-send-rate",
