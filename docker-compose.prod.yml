@@ -1134,6 +1134,52 @@ services:
             redis7:
                 condition: service_healthy
 
+    # One-shot historical-event importer for Mixpanel/Amplitude/raw-captured data.
+    # Leases jobs from the `posthog_batchimport` Postgres table (created via
+    # ee/scripts/mixpanel_import/create_import.py) and ships events directly to
+    # the `events_plugin_ingestion_historical` Kafka topic, bypassing the
+    # capture HTTP layer for ~50x throughput. See ee/scripts/mixpanel_import/RUNBOOK.md.
+    #
+    # Gated behind the `migration` profile so it stays OFF on normal up/down.
+    # Enable for the duration of an import with:
+    #   docker compose --profile migration up -d batch-import-worker
+    # Disable when done:
+    #   docker compose --profile migration down batch-import-worker
+    batch-import-worker:
+        profiles: [migration]
+        <<: [*restart-prod, *mem-rust-hot]
+        image: posthog-batch-import-worker
+        build:
+            context: ./rust
+            args:
+                BIN: batch-import-worker
+        logging: *default-logging
+        environment:
+            DATABASE_URL: 'postgres://posthog:${POSTHOG_DB_PASSWORD}@db:5432/posthog'
+            KAFKA_HOSTS: 'kafka:9092'
+            KAFKA_TOPIC_MAIN: 'events_plugin_ingestion'
+            KAFKA_TOPIC_HISTORICAL: 'events_plugin_ingestion_historical'
+            KAFKA_TOPIC_OVERFLOW: 'events_plugin_ingestion_overflow'
+            # Worker reads `ENCRYPTION_KEYS`; Django reads `ENCRYPTION_SALT_KEYS`.
+            # Both default to the same dev key (00beef…) but MUST match in prod
+            # so the worker can decrypt `BatchImport.secrets` written by Django.
+            ENCRYPTION_KEYS: ${ENCRYPTION_SALT_KEYS:-00beef0000beef0000beef0000beef00}
+            BIND_HOST: '0.0.0.0'
+            BIND_PORT: '3301'
+            RUST_LOG: 'info,sqlx::query=warn,rdkafka=warn'
+        # Tempfile cache for s3_gzip source extraction. The worker decompresses
+        # each gzipped key to /tmp before reading. With daily ~50–200 MB
+        # uncompressed files (Mixpanel) this is plenty.
+        tmpfs:
+            - /tmp:size=4g
+        depends_on:
+            db:
+                condition: service_healthy
+            kafka:
+                condition: service_healthy
+            kafka-init:
+                condition: service_completed_successfully
+
 volumes:
     zookeeper-data:
     zookeeper-datalog:
