@@ -51,7 +51,13 @@ DEFAULTS = {
     # resolve via KAFKA_TOPIC_MAIN / KAFKA_TOPIC_HISTORICAL / KAFKA_TOPIC_OVERFLOW
     # env vars on the worker (set in docker-compose.prod.yml).
     "KAFKA_TOPIC_ALIAS": "historical",
-    "KAFKA_SEND_RATE": "20000",
+    # 80000 events/sec sustained — empirically safe with the default 4-replica
+    # `ingestion-general` consumer (each replica handles ~10–20k events/sec from
+    # `events_plugin_ingestion_historical`, so aggregate ceiling is ~40–80k).
+    # Pushing higher just builds Kafka lag (durable, fine for one-shot import,
+    # but masks real bottleneck). Override per-job with KAFKA_SEND_RATE env or
+    # --kafka-send-rate. Lower if downstream lag grows unbounded.
+    "KAFKA_SEND_RATE": "80000",
     "KAFKA_TXN_TIMEOUT_S": "60",
     "MIXPANEL_TIMESTAMP_OFFSET_SECONDS": "0",
     "MIXPANEL_SKIP_NO_DISTINCT_ID": "false",
