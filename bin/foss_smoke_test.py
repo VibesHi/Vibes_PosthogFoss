@@ -159,7 +159,61 @@ except Exception as e:
     failures.append(f"ORG FEATURE CHECK FAIL: {type(e).__name__}: {e}")
 
 # -------------------------------------------------------------------
-# 6) URL resolver: confirm routes exist (don't hit them, just resolve).
+# 6) Materialized columns FOSS patch regression check.
+#    posthog/clickhouse/materialized_columns.py has a FOSS `else:` branch
+#    (see README.prod.md "FOSS source patches") that wires the read path
+#    to ee/clickhouse/materialized_columns/columns.py. If either side
+#    regresses to upstream-pristine the HogQL printer silently emits
+#    JSONExtractRaw on every property access -- 5-10x slowdown on
+#    Web/Product Analytics queries with no error. We can't catch this with
+#    Python type checks alone, so probe the wiring directly.
+# -------------------------------------------------------------------
+try:
+    from posthog.clickhouse.materialized_columns import (
+        get_enabled_materialized_columns,
+        get_materialized_column_for_property,
+    )
+    from ee.clickhouse.materialized_columns.columns import materialize as _ee_materialize  # noqa: F401
+
+    # The EE module must expose the real `materialize` callable, not a stub.
+    # If it's a no-op stub, calling materialize("events", "$probe") would
+    # silently do nothing (the original FOSS strip behavior).
+    if not callable(_ee_materialize) or _ee_materialize.__module__ != "ee.clickhouse.materialized_columns.columns":
+        failures.append(
+            "MATERIALIZED COLUMNS REGRESSION: ee.clickhouse.materialized_columns.columns.materialize "
+            "is not a real callable (looks like the FOSS stub got re-introduced)"
+        )
+
+    # The introspection must return a dict (possibly empty), not None or {}.
+    # Empty is fine -- means no columns materialized yet -- but the function
+    # must execute the system.columns query without raising.
+    cols = get_enabled_materialized_columns("events")
+    if not isinstance(cols, dict):
+        failures.append(
+            f"MATERIALIZED COLUMNS REGRESSION: get_enabled_materialized_columns('events') "
+            f"returned {type(cols).__name__}, expected dict"
+        )
+
+    # The function must NOT unconditionally return None (the FOSS pre-Tier-1
+    # behavior). On a fresh CH install events table has $session_id,
+    # $window_id, $group_0..4 baked in via EVENTS_TABLE_SQL -- if any of
+    # those are present, get_materialized_column_for_property must find them.
+    if cols:
+        # Pick any (property, table_column) pair from the introspection
+        # and verify get_materialized_column_for_property returns the same.
+        (sample_prop, sample_col), sample_mc = next(iter(cols.items()))
+        result = get_materialized_column_for_property("events", sample_col, sample_prop)
+        if result is None:
+            failures.append(
+                f"MATERIALIZED COLUMNS REGRESSION: get_materialized_column_for_property "
+                f"returned None for ({sample_prop!r}, {sample_col!r}) which IS in "
+                f"get_enabled_materialized_columns -- FOSS `else:` branch likely missing or broken"
+            )
+except Exception as e:
+    failures.append(f"MATERIALIZED COLUMNS PROBE FAIL: {type(e).__name__}: {e}")
+
+# -------------------------------------------------------------------
+# 7) URL resolver: confirm routes exist (don't hit them, just resolve).
 # -------------------------------------------------------------------
 try:
     from django.urls import resolve
@@ -198,6 +252,7 @@ else:
         f"{len(EE_IMPORTS)} imports, "
         f"{sum(len(v) for v in EXPECTED_MIXIN_METHODS.values())} mixin methods, "
         f"{len(ORM_PROBES)} ORM probes, 1 reverse-FK, 1 org-feature, "
+        f"1 materialized-columns probe, "
         f"{len(URL_PROBES)} URL probes)"
     )
     sys.exit(0)

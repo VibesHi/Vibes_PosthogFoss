@@ -28,15 +28,29 @@ if EE_AVAILABLE:
 
         return get_enabled_materialized_columns(table).get((property_name, table_column))
 else:
-    # FOSS: re-export the EE stub's no-op so consumers that lazy-import this
-    # symbol (e.g. `posthog/hogql_queries/web_analytics/events_prefilter.py`)
-    # don't ImportError at request time and 500 the WebAnalytics tiles.
-    # The stub returns an empty dict, which makes callers fall back to
-    # JSONExtractRaw on the events.properties column. Slightly slower than
-    # materialized columns but functionally correct.
+    # FOSS patch: behave the same as the `if EE_AVAILABLE:` branch above. The
+    # `ee.clickhouse.materialized_columns.columns` module in this fork is a
+    # faithful port of upstream (no EE-licensed code paths), so the read-path
+    # introspection works without flipping the global EE_AVAILABLE gate (which
+    # would unleash ~20 other EE branches across RBAC, Vercel, scheduled
+    # subscriptions, etc. — see posthog/settings/ee.py for rationale).
+    #
+    # Two effects:
+    #   1. Unconditional `from posthog.clickhouse.materialized_columns import
+    #      get_enabled_materialized_columns` (used in events_prefilter.py and
+    #      others) doesn't ImportError.
+    #   2. The HogQL printer's call to get_materialized_column_for_property
+    #      (printer/base.py:45) now returns real MaterializedColumn objects, so
+    #      `properties.$xxx` accesses get rewritten to `mat_$xxx` columns when
+    #      they exist instead of falling back to JSONExtractRaw on the raw JSON.
+    #
+    # Documented in README.prod.md "FOSS source patches".
     from ee.clickhouse.materialized_columns.columns import get_enabled_materialized_columns
 
     def get_materialized_column_for_property(
         table: TablesWithMaterializedColumns, table_column: TableColumn, property_name: PropertyName
     ) -> MaterializedColumn | None:
-        return None
+        if not get_instance_setting("MATERIALIZED_COLUMNS_ENABLED"):
+            return None
+
+        return get_enabled_materialized_columns(table).get((property_name, table_column))

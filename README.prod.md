@@ -289,6 +289,26 @@ the right order.
 - All env wiring (`OBJECT_STORAGE_*`, `SESSION_RECORDING_V2_*`, `OTEL_*`, etc.)
 - Caddy reverse proxy on `:80`/`:443` with auto-TLS via Let's Encrypt.
 
+---
+
+## FOSS source patches
+
+Files inside `posthog/` (upstream) that this fork modifies. Every patch is
+listed here — no undocumented divergence from upstream `posthog/`. When
+pulling new upstream master, diff these files first:
+
+```bash
+git diff origin/master -- posthog/settings/ee.py posthog/clickhouse/materialized_columns.py
+```
+
+Validate with `bin/foss-smoke-test` after every upstream sync — it has
+explicit regression checks for these patches.
+
+| File | Patch | Reason |
+|---|---|---|
+| `posthog/settings/ee.py` | Hardcoded `EE_AVAILABLE = False` (file is fully replaced; full rationale in file header). | Permanent kill switch for `if EE_AVAILABLE:` branches across the codebase. ~20 such branches gate things like RBAC enforcement, Vercel API, scheduled subscriptions, materialized_column_slot viewset, enterprise event/property definitions, SAML SSO. Most have backends in `ee/` that are no-op stubs (return `{}`, return `None`, or raise 501) — flipping `EE_AVAILABLE` True would activate them and produce inconsistent / broken behavior. |
+| `posthog/clickhouse/materialized_columns.py` | Modified `else:` branch (when `EE_AVAILABLE=False`): re-imports `get_enabled_materialized_columns` from `ee/` (which is a faithful port of upstream, NOT a stub) and wires `get_materialized_column_for_property` to call it instead of returning `None`. | Two effects: **(1)** unconditional `from posthog.clickhouse.materialized_columns import get_enabled_materialized_columns` in upstream call sites (e.g. `posthog/hogql_queries/web_analytics/events_prefilter.py`) doesn't `ImportError`; **(2)** the HogQL printer's `_get_materialized_column` (`printer/base.py:45`) returns real `MaterializedColumn` objects, so `properties.$xxx` accesses get rewritten to `mat_$xxx` columns — without this patch the printer always emits `JSONExtractRaw(properties, '$xxx')` even when materialized columns exist, causing 5-10× slowdown on Web/Product Analytics queries. Depends on `ee/clickhouse/materialized_columns/columns.py` being a faithful upstream port (commit `e306efc469`), not the previous FOSS no-op stub. |
+
 ### Required env vars
 
 `.env.example.prod` lists everything. Required:
@@ -447,6 +467,33 @@ distinct_ids (e.g. shared API key, single test user generating lots of
 events). The fix is application-side — make your distinct_ids actually
 distinct, or set `process_person_profile=false` on bot/test traffic so PG
 isn't touched at all.
+
+### Web Analytics pre-aggregated tables (currently unfilled)
+
+Upstream PostHog Cloud uses Dagster to maintain pre-aggregated rollup
+tables (`web_pre_aggregated_stats`, `web_pre_aggregated_bounces`) that
+back Web Analytics tiles for 10-100× faster queries on multi-month
+windows. The CH tables exist on this fork (created by migration
+`0130_add_web_analytics_utc_hourly_tables.py`), the insert SQL is in
+`posthog/models/web_preaggregated/sql.py`, and the read path checks
+the `useWebAnalyticsPreAggregatedTables` modifier on each query
+(`web_overview.py:43`, `notable_changes.py:98`). UI toggle exists in
+`WebAnalyticsHeaderButtons.tsx`.
+
+**What's missing:** the Dagster scheduler that fills the tables. This
+fork has no Dagster service in `docker-compose.prod.yml`, so the
+hourly/daily fill jobs never fire. Tables stay empty. The toggle in the
+UI does nothing useful.
+
+To enable on this fork, replace Dagster with a Celery beat task (~80
+lines): port the partition-swap logic from
+`products/web_analytics/dags/web_preaggregated.py:80-180` into
+`posthog/tasks/web_preaggregated.py`, register an hourly + daily entry
+in `posthog/celery.py` beat schedule. No new infra needed.
+
+Skip this entirely if your install only ingests mobile / non-`$pageview`
+events — preagg schema is web-shaped (`pathname`, `host`, `referring_domain`,
+`utm_*`) and most fields stay null on mobile traffic.
 
 ### Load testing the capture endpoint
 
