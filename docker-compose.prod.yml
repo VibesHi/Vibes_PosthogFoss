@@ -38,8 +38,8 @@ x-restart-prod: &restart-prod
 # `mem_limit` is enforced by plain `docker compose up`. The newer
 # `deploy.resources.limits` block is Swarm-only and silently ignored.
 #
-# Overcommit: the SUM of all caps below (~53 GB with capture × 3 replicas
-# and ingestion-general × 6 replicas) intentionally exceeds the 30 GB host.
+# Overcommit: the SUM of all caps below (~50 GB with capture × 3 replicas
+# and ingestion-general × 4 replicas) intentionally exceeds the 30 GB host.
 # Caps are upper bounds, not reservations — services don't all peak
 # simultaneously. Realistic steady-state usage is ~25-28 GB; the caps are
 # spike absorbers for sustained ingestion bursts. The 4 GB swap (see
@@ -54,8 +54,8 @@ x-restart-prod: &restart-prod
 #
 # Throughput scaling levers:
 #   capture replicas (default 3)              → see `services.capture.deploy`
-#   ingestion-general replicas (default 6)    → see `services.ingestion-general.deploy`
-#   Kafka partitions (default 6)              → KAFKA_INGESTION_PARTITIONS in .env
+#   ingestion-general replicas (default 4)    → see `services.ingestion-general.deploy`
+#   Kafka partitions (default 4)              → KAFKA_INGESTION_PARTITIONS in .env
 #   Kafka seastar --memory (default 5G)       → see `services.kafka.command`
 #   web prefork processes (default 2)         → NGINX_UNIT_APP_PROCESSES in .env
 #   worker Celery prefork (default 2)         → WEB_CONCURRENCY in .env
@@ -76,8 +76,8 @@ x-mem-postgres:   &mem-postgres    { mem_limit: 4g,     memswap_limit: 5g }
 # you also raise `--memory` in the command override.
 # Tuned for max ingestion throughput. base.yml ships seastar with
 # `--memory 3G --reserve-memory 500M` which is fine for ~3-5k events/sec.
-# For sustained 5k-15k events/sec with 6-partition events_plugin_ingestion,
-# 3 capture producers, 6 ingestion-general consumers all batching in flight,
+# For sustained 5k-15k events/sec with 4-partition events_plugin_ingestion,
+# 3 capture producers, 4 ingestion-general consumers all batching in flight,
 # seastar needs `--memory 5G` to keep producer queues from blocking on
 # `producer-queue-full`. 6g cgroup leaves ~1g headroom above seastar.
 # Override applied in the `kafka` service block below.
@@ -516,61 +516,26 @@ services:
             file: docker-compose.base.yml
             service: ingestion-general
         logging: *default-logging
-        # Six replicas for max ingestion throughput. Rust capture partitions
+        # Four replicas for max ingestion throughput. Rust capture partitions
         # Kafka messages by `{token}:{distinct_id}` (rust/common/types/src/event.rs:304),
         # so events for the same user always land on the same partition --
         # N consumers in the same group safely parallelize without breaking
         # person ordering, as long as Kafka has >= N partitions on
         # `events_plugin_ingestion` (configured in kafka-init below; both
         # `events_plugin_ingestion` and `events_plugin_ingestion_historical`
-        # are sized to 6 partitions, so 6 replicas = exactly 1 partition each
+        # are sized to 4 partitions, so 4 replicas = exactly 1 partition each
         # under cooperative-sticky assignment).
         #
-        # Empirical per-replica ceiling on this 8-core / 30G host with PostHog
-        # 1.x ingestion-v2 + personless mode + GeoIP transformation disabled:
-        # ~1k events/sec at default CONSUMER_MAX_BACKGROUND_TASKS=1 (foreground
-        # processing serialized behind the previous batch's Kafka produce flush).
-        # With CONSUMER_MAX_BACKGROUND_TASKS=4 + CONSUMER_BATCH_SIZE=2000 (set
-        # below), this rises to ~3-4k/sec per replica -- aggregate ~15-20k/sec
-        # across 6 replicas, until CH/PG become the new bottleneck.
-        # See ee/scripts/mixpanel_import/RUNBOOK.md for the migration tuning
-        # path (Phases 2.1, 2.2) that gets to this rate.
-        #
-        # Going beyond 6 requires also expanding partitions on the historical
-        # topic (rpk topic alter-config ... --set-partitions N, irreversible)
-        # AND ~1.5 cores per extra replica, which this 8-core box does not
-        # have headroom for. 12 replicas would push peak load avg to ~15+
-        # and oversubscribe by ~90%, hurting throughput more than it helps.
-        # See `top` and `uptime` during peak ingestion before raising further.
-        #
-        # Each replica gets its own 1.5g mem_limit (6 × 1.5 = 9g total).
+        # Each Node consumer caps at ~3-5k msgs/sec; 4 replicas = ~12-20k
+        # sustained. Each replica gets its own 1.5g mem_limit (6g total).
         # If "too many connections" errors appear, lower POSTGRES_MAX_CONNECTIONS
-        # in .env -- each replica opens ~30 conns at peak (6 × 30 = 180 conns).
+        # in .env -- each replica opens ~30 conns at peak.
         deploy:
-            replicas: 6
+            replicas: 4
         environment:
             <<: *pg-env
             CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
             ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
-            # Pipeline N batches' Kafka produce-flushes concurrently per consumer.
-            # The "background task" wraps `awaitScheduledWork` -- waiting for all
-            # produces (clickhouse_events_json, clickhouse_person, etc.) to ack.
-            # Default 1 (nodejs/src/common/config.ts) means each poll() blocks on
-            # the previous batch's full produce-flush before processing the next
-            # batch -- per-consumer ceiling ~= CONSUMER_BATCH_SIZE / (fgMs + kafkaFlushMs).
-            # With 4, foreground processing of batch N+1 can start while produces
-            # for batches N, N-1, N-2 are still in flight. Expected 2-3x throughput.
-            # Risk: at-least-once redelivery on crash up to 4 * CONSUMER_BATCH_SIZE
-            # events (offset commit waits for all in-flight batches in-order, see
-            # nodejs/src/kafka/consumer.ts:760-778). Safe for the Mixpanel import
-            # because every event has a deterministic $insert_id and we land on
-            # ReplacingMergeTree (sharded_events) which dedupes on the UUID.
-            CONSUMER_MAX_BACKGROUND_TASKS: 4
-            # Bigger Kafka poll batches amortize the per-flush overhead. Doubles
-            # memory per replica (~6MB extra at 2000 msgs * 3KB avg) -- negligible
-            # vs the 1.5G mem_limit. Going much higher hurts because the foreground
-            # `flushBatchStoresStep` blocks the pipeline until done.
-            CONSUMER_BATCH_SIZE: 2000
         # Map-style depends_on so we can pin kafka-init to
         # `service_completed_successfully`. Without this consumers
         # could join the consumer group before partitions exist, briefly
@@ -1084,16 +1049,20 @@ services:
                     fi
                 done
 
-                # Multi-partition topics. ingestion-general runs with replicas=6;
-                # consumer parallelism is bounded by partition count. With 6
-                # partitions and 6 replicas: 1 partition per consumer, no
+                # Multi-partition topics. ingestion-general runs with replicas=4;
+                # consumer parallelism is bounded by partition count. With 4
+                # partitions and 4 replicas: 1 partition per consumer, no
                 # imbalance under cooperative-sticky assignment. Rust capture partitions
                 # by `{token}:{distinct_id}` (see rust/common/types/src/event.rs:304),
                 # so per-user ordering holds regardless of partition count. The
                 # `_overflow` topic mirrors the main one because the same consumer
                 # drains both. Override KAFKA_INGESTION_PARTITIONS in .env to
                 # scale further (each partition = 1 max-throughput consumer).
-                INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-6}
+                # NOTE: Kafka partitions can ONLY be GROWN, never shrunk. To
+                # decrease, you must delete the topic and recreate it (loses
+                # any unconsumed events). See "shrink partitions" in
+                # ee/scripts/mixpanel_import/RUNBOOK.md.
+                INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-4}
                 # `_historical` is included so one-shot batch-import-worker jobs
                 # (Mixpanel/Amplitude backfills) get the same parallelism as the
                 # live `events_plugin_ingestion` topic. Without it the worker
