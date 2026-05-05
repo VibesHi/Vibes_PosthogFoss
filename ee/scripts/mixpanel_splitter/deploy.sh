@@ -28,7 +28,12 @@ set -euo pipefail
 : "${SPLITTER_SA_EMAIL:?set SPLITTER_SA_EMAIL}"
 
 REGION="${REGION:-europe-west4}"
-IMAGE_REPO="${IMAGE_REPO:-gcr.io/$GCP_PROJECT/mixpanel-splitter}"
+# gcr.io is shut down (March 2025) — use Artifact Registry. The deploy script
+# auto-creates the AR repo `cloud-run-source-deploy` if missing (this is the
+# default name `gcloud builds submit` uses when no --tag is set, but we need
+# an explicit repo so the job's image is reproducible).
+AR_REPO="${AR_REPO:-cloud-run-source-deploy}"
+IMAGE_REPO="${IMAGE_REPO:-$REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/mixpanel-splitter}"
 JOB_NAME="${JOB_NAME:-mixpanel-splitter}"
 SRC_PREFIX="${SRC_PREFIX:-}"
 DST_PREFIX="${DST_PREFIX:-mixpanel-daily/}"
@@ -36,11 +41,22 @@ CONCURRENCY="${CONCURRENCY:-4}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-86400s}"
 CPU="${CPU:-4}"
 MEMORY="${MEMORY:-4Gi}"
+INPUT_PATTERN="${INPUT_PATTERN:-events_}"
+DRY_RUN="${DRY_RUN:-false}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # optional comma-separated, e.g. ",--max-line-bytes=8388608"
 
 IMAGE_TAG="$(date -u +%Y%m%d-%H%M%S)"
 IMAGE_URI="$IMAGE_REPO:$IMAGE_TAG"
 
 cd "$(dirname "$0")"
+
+echo "[0/4] Ensuring Artifact Registry repo '$AR_REPO' exists in $REGION ..."
+gcloud artifacts repositories describe "$AR_REPO" \
+    --project="$GCP_PROJECT" --location="$REGION" >/dev/null 2>&1 || \
+gcloud artifacts repositories create "$AR_REPO" \
+    --project="$GCP_PROJECT" --location="$REGION" \
+    --repository-format=docker \
+    --description="Container images for one-shot Cloud Run jobs"
 
 echo "[1/4] Building image $IMAGE_URI ..."
 gcloud builds submit \
@@ -62,7 +78,7 @@ gcloud run jobs deploy "$JOB_NAME" \
     --max-retries=0 \
     --parallelism=1 \
     --tasks=1 \
-    --args="--bucket=$GCS_BUCKET,--src-prefix=$SRC_PREFIX,--dst-prefix=$DST_PREFIX,--concurrency=$CONCURRENCY"
+    --args="--bucket=$GCS_BUCKET,--src-prefix=$SRC_PREFIX,--dst-prefix=$DST_PREFIX,--concurrency=$CONCURRENCY,--input-pattern=$INPUT_PATTERN,--dry-run=$DRY_RUN$EXTRA_ARGS"
 
 echo "[3/4] Executing job (will block until completion or task-timeout)..."
 echo "      Tail logs in another terminal: gcloud beta run jobs logs tail $JOB_NAME --region=$REGION --project=$GCP_PROJECT"
