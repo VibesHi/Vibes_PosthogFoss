@@ -113,6 +113,12 @@ x-mem-rust:       &mem-rust        { mem_limit: 256m,   memswap_limit: 384m }
 # backpressure. 1g gives ~5x headroom over peak (~200MB) so the producer
 # never has to drop or block on backpressure.
 x-mem-rust-hot:   &mem-rust-hot    { mem_limit: 1g,     memswap_limit: 1g }
+# Fat rust profile for the batch-import-worker. The Mixpanel parser explodes
+# ~100MB chunks into ~500MB of in-memory event structures (HashMap<String,Value>
+# per event), plus the librdkafka transactional producer batches another
+# ~256MB before flushing. Default mem-rust-hot (1g) OOM-killed the worker on
+# the very first 800MB-decompressed daily file. 4g leaves clear headroom.
+x-mem-rust-fat:   &mem-rust-fat    { mem_limit: 4g,     memswap_limit: 4g }
 x-mem-tiny:       &mem-tiny        { mem_limit: 256m,   memswap_limit: 256m }
 x-mem-xtiny:      &mem-xtiny       { mem_limit: 128m,   memswap_limit: 128m }
 
@@ -1147,7 +1153,7 @@ services:
     #   docker compose --profile migration down batch-import-worker
     batch-import-worker:
         profiles: [migration]
-        <<: [*restart-prod, *mem-rust-hot]
+        <<: [*restart-prod, *mem-rust-fat]
         image: posthog-batch-import-worker
         build:
             context: ./rust
@@ -1167,9 +1173,15 @@ services:
             BIND_HOST: '0.0.0.0'
             BIND_PORT: '3301'
             RUST_LOG: 'info,sqlx::query=warn,rdkafka=warn'
+            # Lower chunk size from default 100MB → 32MB. The worker buffers a
+            # whole chunk in memory and the Mixpanel parser explodes each chunk
+            # into ~5x its raw size as HashMap<String, Value> events. 32MB raw
+            # → ~160MB parsed → comfortable inside the 4g cgroup with plenty
+            # left for the Kafka transactional producer's own batch buffers.
+            CHUNK_SIZE: '32000000'
         # Tempfile cache for s3_gzip source extraction. The worker decompresses
-        # each gzipped key to /tmp before reading. With daily ~50–200 MB
-        # uncompressed files (Mixpanel) this is plenty.
+        # each gzipped key to /tmp before reading. Mixpanel daily files
+        # decompress to ~800MB-1.5GB, so 4g leaves room for 2-3 keys in flight.
         tmpfs:
             - /tmp:size=4g
         depends_on:
