@@ -1056,7 +1056,12 @@ services:
                 # drains both. Override KAFKA_INGESTION_PARTITIONS in .env to
                 # scale further (each partition = 1 max-throughput consumer).
                 INGEST_PARTS=$${KAFKA_INGESTION_PARTITIONS:-6}
-                for topic in events_plugin_ingestion events_plugin_ingestion_overflow; do
+                # `_historical` is included so one-shot batch-import-worker jobs
+                # (Mixpanel/Amplitude backfills) get the same parallelism as the
+                # live `events_plugin_ingestion` topic. Without it the worker
+                # auto-creates the topic with Redpanda's default 1 partition,
+                # bottlenecking ingest to a single ingestion-general consumer.
+                for topic in events_plugin_ingestion events_plugin_ingestion_overflow events_plugin_ingestion_historical; do
                     if rpk topic create "$$topic" --brokers kafka:9092 -p "$$INGEST_PARTS" -r 1 2>&1; then
                         echo "Topic $$topic created with $$INGEST_PARTS partitions"
                     else

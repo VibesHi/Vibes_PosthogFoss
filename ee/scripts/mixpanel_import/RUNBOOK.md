@@ -38,18 +38,24 @@ gsutil cat gs://posthog-helper-bucket/events_2024-03-01_2024-03-31.jsonl \
 Want: `{event, properties:{time, distinct_id, $insert_id, ...}}`. Already
 verified for this dataset on 2026-05-05.
 
-### 0.2 Confirm Kafka historical topic exists in your cluster
+### 0.2 Confirm Kafka historical topic exists with the right partition count
+
+The compose `kafka-init` service idempotently creates/grows
+`events_plugin_ingestion_historical` to `KAFKA_INGESTION_PARTITIONS` (default
+6) on every startup. Verify after a deploy:
 
 ```bash
 docker compose -f docker-compose.prod.yml exec kafka \
-    rpk topic describe events_plugin_ingestion_historical
+    rpk topic describe events_plugin_ingestion_historical | head -10
 ```
-If it doesn't exist yet, capture's first historical-flagged event creates it
-with default partitions. Or pre-create:
-```bash
-docker compose -f docker-compose.prod.yml exec kafka \
-    rpk topic create events_plugin_ingestion_historical -p 6 -r 1
-```
+
+Want to see `PARTITIONS 6` (or whatever `KAFKA_INGESTION_PARTITIONS` is set to
+in `.env`). If you see 1 partition, the kafka-init script didn't run or
+didn't include this topic — check `docker compose logs kafka-init` and
+re-run `docker compose -f docker-compose.prod.yml up -d --force-recreate
+kafka-init`. Without enough partitions, only one of the 4 `ingestion-general`
+consumer replicas can drain the topic, and worker throughput is bottlenecked
+to ~5–10k events/sec regardless of the worker's `send_rate` setting.
 
 ### 0.3 Note your team_id and ENCRYPTION_SALT_KEYS
 
