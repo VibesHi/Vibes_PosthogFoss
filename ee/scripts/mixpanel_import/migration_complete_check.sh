@@ -155,6 +155,7 @@ lag_for_group() {
 
 check_group() {
     local group=$1
+    local is_migration_critical=$2  # "yes" = lag fails the script; "no" = warn-only
     local res real_lag phantom_lag
     res=$(lag_for_group "$group")
     if [[ "$res" == "MISSING" ]]; then
@@ -167,21 +168,33 @@ check_group() {
     if [[ "$real_lag" -eq 0 && "$phantom_lag" -eq 0 ]]; then
         ok "group '$group': fully caught up (real_lag=0, no retention loss)"
     elif [[ "$real_lag" -eq 0 && "$phantom_lag" -gt 0 ]]; then
-        warn "group '$group': real_lag=0 (caught up) BUT phantom_lag=$phantom_lag — retention deleted those events before the consumer drained them. Real damage to assess: run with the relevant YYYY-MM args."
+        if [[ "$is_migration_critical" == "yes" ]]; then
+            fail "group '$group': real_lag=0 BUT phantom_lag=$phantom_lag — retention deleted events before the consumer drained them. The per-day count check below is the only ground truth — if it passes, you're fine; if not, those days lost data."
+            mark_fail
+        else
+            warn "group '$group': real_lag=0 (caught up), phantom_lag=$phantom_lag (live-traffic group, irrelevant to this migration)"
+        fi
     elif [[ "$real_lag" -le "$LAG_OK_THRESHOLD" && "$phantom_lag" -eq 0 ]]; then
         warn "group '$group': real_lag=$real_lag (≤ $LAG_OK_THRESHOLD, likely live trickle — re-run in 30s to confirm draining)"
     elif [[ "$real_lag" -gt "$LAG_OK_THRESHOLD" ]]; then
-        fail "group '$group': real_lag=$real_lag — wait for it to drain before reverting (phantom_lag=$phantom_lag)"
-        mark_fail
+        if [[ "$is_migration_critical" == "yes" ]]; then
+            fail "group '$group': real_lag=$real_lag — wait for it to drain before reverting (phantom_lag=$phantom_lag)"
+            mark_fail
+        else
+            warn "group '$group': real_lag=$real_lag (live-traffic group, ongoing production — unrelated to the migration consumer; phantom_lag=$phantom_lag)"
+        fi
     else
         warn "group '$group': real_lag=$real_lag, phantom_lag=$phantom_lag"
     fi
 }
 
 hdr "1-3. Kafka consumer-group lag"
-check_group clickhouse-ingestion-historical
-check_group clickhouse-ingestion
-check_group group1
+# Only the historical consumer is migration-critical. The other two carry live
+# production SDK traffic and will always show some lag — flagging them as failure
+# made the script useless. Per-day count parity (#4 below) is the ground truth.
+check_group clickhouse-ingestion-historical yes
+check_group clickhouse-ingestion           no
+check_group group1                         no
 
 # ------------- 4. Per-day count comparison -------------
 
