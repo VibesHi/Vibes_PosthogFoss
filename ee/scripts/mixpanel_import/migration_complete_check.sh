@@ -100,57 +100,81 @@ mark_fail() { EXIT_CODE=1; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 # ------------- 1-3. Kafka lag checks -------------
-
-# rpk group describe prints `TOTAL-LAG <n>` in the header and a per-partition
-# table. We try the header first, then fall back to summing the LAG column.
 #
-# Column index for LAG varies across rpk versions (older = 5, newer = 6 because
-# of an inserted LOG-START-OFFSET), so locate it dynamically by header name
-# instead of hardcoding.
-total_lag_for_group() {
+# Naive lag (the number `rpk group describe` shows as TOTAL-LAG) is just
+#     LAG = LOG-END-OFFSET - CURRENT-OFFSET
+# which doesn't distinguish:
+#   (a) real pending: consumer is behind, data still on disk
+#   (b) phantom: data was deleted by retention before the consumer caught up;
+#       CURRENT-OFFSET still points at deleted offsets so the math says "lag"
+#       but there's nothing to consume. The committed offset never advances
+#       because there are no messages to process and commit.
+#
+# We compute both separately by parsing the per-partition table:
+#   real_lag    = sum(max(0, LOG-END - max(CURRENT, LOG-START)))
+#   phantom_lag = sum(max(0, LOG-START - CURRENT))
+#
+# real_lag = 0 means the group is functionally caught up, even if rpk shows
+# nonzero TOTAL-LAG.
+
+# Returns "<real_lag> <phantom_lag>" on stdout, or "MISSING" if the group
+# doesn't exist.
+lag_for_group() {
     local group=$1
-    local out total
+    local out
     out=$(dc exec -T "$KAFKA_SERVICE" rpk group describe "$group" 2>/dev/null || true)
     if [[ -z "$out" ]]; then
         echo "MISSING"
         return
     fi
-    total=$(awk '/^TOTAL-LAG[[:space:]]/ {print $2; exit}' <<<"$out")
-    if [[ -z "$total" || "$total" == "-" ]]; then
-        total=$(awk '
-            BEGIN { in_table=0; lag_col=0; t=0 }
-            /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
-                in_table=1
-                for (i=1; i<=NF; i++) if ($i == "LAG") lag_col=i
-                next
+    awk '
+        BEGIN { in_table=0; cur_col=0; start_col=0; end_col=0; real=0; phantom=0 }
+        /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
+            in_table=1
+            for (i=1; i<=NF; i++) {
+                if ($i == "CURRENT-OFFSET")   cur_col=i
+                if ($i == "LOG-START-OFFSET") start_col=i
+                if ($i == "LOG-END-OFFSET")   end_col=i
             }
-            in_table && lag_col > 0 && $lag_col ~ /^[0-9]+$/ { t += $lag_col }
-            END { print t+0 }
-        ' <<<"$out")
-    fi
-    echo "${total:-0}"
+            next
+        }
+        in_table && cur_col > 0 && end_col > 0 && $cur_col ~ /^[0-9]+$/ {
+            cur = $cur_col + 0
+            end = $end_col + 0
+            # LOG-START-OFFSET column may be absent in older rpk versions; if
+            # so, default to 0 (then phantom is always 0 and real == raw lag).
+            start = (start_col > 0 && $start_col ~ /^[0-9]+$/) ? $start_col + 0 : 0
+            effective = (cur > start) ? cur : start
+            r = end - effective; if (r < 0) r = 0
+            p = start - cur;     if (p < 0) p = 0
+            real += r; phantom += p
+        }
+        END { print real " " phantom }
+    ' <<<"$out"
 }
 
 check_group() {
     local group=$1
-    local lag
-    lag=$(total_lag_for_group "$group")
-    if [[ "$lag" == "MISSING" ]]; then
+    local res real_lag phantom_lag
+    res=$(lag_for_group "$group")
+    if [[ "$res" == "MISSING" ]]; then
         warn "group '$group': not found (skip — only matters if you produced to it)"
         return
     fi
-    if ! [[ "$lag" =~ ^[0-9]+$ ]]; then
-        fail "group '$group': could not parse lag from rpk output"
+    real_lag=$(awk '{print $1+0}' <<<"$res")
+    phantom_lag=$(awk '{print $2+0}' <<<"$res")
+
+    if [[ "$real_lag" -eq 0 && "$phantom_lag" -eq 0 ]]; then
+        ok "group '$group': fully caught up (real_lag=0, no retention loss)"
+    elif [[ "$real_lag" -eq 0 && "$phantom_lag" -gt 0 ]]; then
+        warn "group '$group': real_lag=0 (caught up) BUT phantom_lag=$phantom_lag — retention deleted those events before the consumer drained them. Real damage to assess: run with the relevant YYYY-MM args."
+    elif [[ "$real_lag" -le "$LAG_OK_THRESHOLD" && "$phantom_lag" -eq 0 ]]; then
+        warn "group '$group': real_lag=$real_lag (≤ $LAG_OK_THRESHOLD, likely live trickle — re-run in 30s to confirm draining)"
+    elif [[ "$real_lag" -gt "$LAG_OK_THRESHOLD" ]]; then
+        fail "group '$group': real_lag=$real_lag — wait for it to drain before reverting (phantom_lag=$phantom_lag)"
         mark_fail
-        return
-    fi
-    if [[ "$lag" -eq 0 ]]; then
-        ok "group '$group': lag=0"
-    elif [[ "$lag" -le "$LAG_OK_THRESHOLD" ]]; then
-        warn "group '$group': lag=$lag (≤ $LAG_OK_THRESHOLD, likely live trickle — re-run in 30s to confirm draining)"
     else
-        fail "group '$group': lag=$lag — wait for it to drain before reverting"
-        mark_fail
+        warn "group '$group': real_lag=$real_lag, phantom_lag=$phantom_lag"
     fi
 }
 

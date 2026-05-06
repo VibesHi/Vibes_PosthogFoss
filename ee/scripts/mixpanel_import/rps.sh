@@ -72,24 +72,37 @@ sum_offsets() {
 }
 
 sum_lag() {
-    # Prefer the header TOTAL-LAG line if present (rpk prints it in the
-    # summary block), else dynamically locate the LAG column.
-    local out total
-    out=$(dc exec -T "$KAFKA_SERVICE" rpk group describe "$1" 2>/dev/null || true)
-    total=$(printf '%s\n' "$out" | awk '/^TOTAL-LAG[[:space:]]/ { print $2; exit }')
-    if [ -z "$total" ] || [ "$total" = "-" ]; then
-        total=$(printf '%s\n' "$out" | awk '
-            BEGIN { in_t=0; lag_col=0; t=0 }
+    # Compute REAL lag (events still pending consumption), excluding phantom
+    # lag from retention loss.
+    #   real_lag = sum(max(0, LOG-END - max(CURRENT, LOG-START)))
+    #
+    # Why: when retention deletes data faster than the consumer drains it, the
+    # committed offset gets stranded behind LOG-START (those offsets no longer
+    # exist on disk). rpk's TOTAL-LAG is just LOG-END - CURRENT — it counts
+    # those deleted events as "lag" even though there's nothing left to fetch.
+    # We treat them as already-gone, since they will never be consumed.
+    dc exec -T "$KAFKA_SERVICE" rpk group describe "$1" 2>/dev/null \
+        | awk '
+            BEGIN { in_t=0; cur_col=0; start_col=0; end_col=0; t=0 }
             /TOPIC[[:space:]]+PARTITION[[:space:]]+CURRENT-OFFSET/ {
                 in_t=1
-                for (i=1; i<=NF; i++) if ($i == "LAG") lag_col=i
+                for (i=1; i<=NF; i++) {
+                    if ($i == "CURRENT-OFFSET")   cur_col=i
+                    if ($i == "LOG-START-OFFSET") start_col=i
+                    if ($i == "LOG-END-OFFSET")   end_col=i
+                }
                 next
             }
-            in_t && lag_col > 0 && $lag_col ~ /^[0-9]+$/ { t += $lag_col }
+            in_t && cur_col > 0 && end_col > 0 && $cur_col ~ /^[0-9]+$/ {
+                cur = $cur_col + 0
+                end = $end_col + 0
+                start = (start_col > 0 && $start_col ~ /^[0-9]+$/) ? $start_col + 0 : 0
+                effective = (cur > start) ? cur : start
+                r = end - effective; if (r < 0) r = 0
+                t += r
+            }
             END { print t+0 }
-        ')
-    fi
-    echo "${total:-0}"
+        '
 }
 
 if [ -t 1 ]; then
