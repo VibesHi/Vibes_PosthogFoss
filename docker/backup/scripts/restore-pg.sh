@@ -100,9 +100,18 @@ This is IRREVERSIBLE except via the pre-restore snapshot."
 # `psql -v ON_ERROR_STOP=1` aborts on the first SQL error instead of plowing
 # through and leaving a half-restored DB. Critical because pg_dumpall's
 # DROP DATABASE / CREATE DATABASE statements can't be wrapped in one txn.
-log "Streaming restore from ${SRC}..."
+#
+# The sed filter strips role-management for the connecting user. pg_dumpall
+# --clean emits `DROP ROLE IF EXISTS <user>; CREATE ROLE <user>; ALTER ROLE
+# <user> WITH ...` which Postgres refuses with `current user cannot be
+# dropped` when we're connected as that user (chicken-and-egg). The role
+# already exists with the right grants (we just connected with it), so
+# skipping these lines is safe and keeps the rest of the dump intact.
+RESTORE_USER="${PGUSER:-posthog}"
+log "Streaming restore from ${SRC} (filtering DROP/CREATE/ALTER ROLE ${RESTORE_USER})..."
 aws_gcs cp "${SRC}" - \
     | gunzip -c \
+    | sed -E "/^DROP ROLE IF EXISTS ${RESTORE_USER};\$/d; /^CREATE ROLE ${RESTORE_USER};\$/d; /^ALTER ROLE ${RESTORE_USER} WITH /d" \
     | PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
         psql --set ON_ERROR_STOP=1 \
              -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" \
