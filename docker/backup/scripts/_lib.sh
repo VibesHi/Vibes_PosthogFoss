@@ -90,17 +90,29 @@ gcs_object_exists() {
 # `clickhouse-client` isn't packaged for alpine repos. Use the HTTP interface
 # (port 8123) instead -- same auth, same SQL, just a different transport.
 #
-# `--fail-with-body` makes curl exit non-zero AND print the response body on
-# 4xx/5xx, so the user sees CH error text in the log.
+# On 4xx/5xx, CH returns the error message in the response body. We capture
+# both stdout AND HTTP code, then on failure print the body to stderr so the
+# caller's `|| die` shows a useful message instead of just "BACKUP failed".
 
 ch_query() {
     require_ch_creds
     local query="$1"
-    curl -sS --fail-with-body \
+    local body http
+    body=$(curl -sS \
+        -o /dev/stdout \
+        -w '\n__HTTP__:%{http_code}' \
         -H "X-ClickHouse-User: default" \
         -H "X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" \
         "http://${CLICKHOUSE_HOST:-clickhouse}:${CLICKHOUSE_PORT_HTTP:-8123}/" \
-        --data-urlencode "query=${query}"
+        --data-urlencode "query=${query}") \
+        || { printf 'CH curl failed (network/connection):\n%s\n' "$body" >&2; return 1; }
+    http=${body##*__HTTP__:}
+    body=${body%$'\n'__HTTP__:*}
+    if [ "$http" -ge 400 ] 2>/dev/null; then
+        printf 'CH HTTP %s -- response body:\n%s\n' "$http" "$body" >&2
+        return 1
+    fi
+    printf '%s' "$body"
 }
 
 # Polls system.backups for the most recent BACKUP/RESTORE command's status
