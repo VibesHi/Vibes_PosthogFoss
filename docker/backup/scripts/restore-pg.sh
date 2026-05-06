@@ -65,13 +65,17 @@ gcs_object_exists "${SRC}" \
 #
 # `psql` failure here means we can't even connect -- if so, restore would
 # fail too. Die before doing anything destructive (no snapshot, no DROP).
+# Connect to `postgres` (the default database, always present), not `posthog`:
+# the latter may not exist yet (fresh cluster) or may have been dropped by a
+# prior failed restore attempt. pg_stat_activity is global -- the query still
+# returns connections to the `posthog` database from any session.
 log "Checking for live PG connections..."
 if ! ACTIVE=$(PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
-    psql -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" -d posthog -tAc \
+    psql -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" -d postgres -tAc \
         "SELECT count(*) FROM pg_stat_activity
          WHERE datname='posthog' AND pid <> pg_backend_pid()
            AND application_name NOT LIKE 'pg_%'"); then
-    die "Failed to connect to PG at ${PGHOST:-db} as ${PGUSER:-posthog}. Refusing to restore -- if we can't connect to query state, we can't restore either. Verify POSTHOG_DB_PASSWORD and that the db service is up."
+    die "Failed to connect to PG at ${PGHOST:-db} as ${PGUSER:-posthog} (db=postgres). Refusing to restore -- if we can't connect to query state, we can't restore either. Verify POSTHOG_DB_PASSWORD and that the db service is up."
 fi
 ACTIVE=${ACTIVE//[[:space:]]/}
 if [ "${ACTIVE:-0}" -gt 0 ]; then
@@ -83,7 +87,8 @@ fi
 
 # --- pre-restore safety net --------------------------------------------------
 PRE_RESTORE="${SENTINEL_DIR}/pre-restore-pg-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
-log "Snapshotting current PG state -> ${PRE_RESTORE} (revert with: gunzip -c ${PRE_RESTORE} | psql -h db -U posthog)"
+REVERT_USER="${PGUSER:-posthog}"
+log "Snapshotting current PG state -> ${PRE_RESTORE} (revert with: gunzip -c ${PRE_RESTORE} | sed -E '/^DROP ROLE IF EXISTS ${REVERT_USER};\$/d; /^CREATE ROLE ${REVERT_USER};\$/d; /^ALTER ROLE ${REVERT_USER} WITH /d' | PGPASSWORD=\$POSTHOG_DB_PASSWORD psql -h db -U ${REVERT_USER} -d postgres)"
 PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
     pg_dumpall --clean --if-exists --no-password \
         -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" \
