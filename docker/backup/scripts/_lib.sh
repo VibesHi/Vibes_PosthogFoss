@@ -62,15 +62,17 @@ http_uri(){ echo "https://storage.googleapis.com/$(gcs_bucket_name)/$1"; }    # 
 #
 # All aws-cli invocations in backup/restore scripts go through this wrapper so
 # the GCS interop endpoint and HMAC creds are configured in exactly one place.
-# `--no-progress` and `--quiet` suppress per-byte progress noise that floods
-# `docker compose logs` for multi-GB uploads.
+#
+# We don't pass --no-progress here: that's a v2-only flag and alpine 3.19
+# ships aws-cli v1. Progress output in v1 only renders to a TTY anyway, so
+# `docker compose logs` from cron is already quiet. For interactive use
+# (`docker compose exec -it backup ...`), the progress bar is fine.
 
 aws_gcs() {
     AWS_ACCESS_KEY_ID="${GCS_HMAC_KEY}" \
     AWS_SECRET_ACCESS_KEY="${GCS_HMAC_SECRET}" \
     AWS_DEFAULT_REGION="${GCS_REGION:-auto}" \
     aws --endpoint-url=https://storage.googleapis.com \
-        --no-progress \
         s3 "$@"
 }
 
