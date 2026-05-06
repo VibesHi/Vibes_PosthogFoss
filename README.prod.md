@@ -529,3 +529,67 @@ is overloaded; bump its replicas in `docker-compose.prod.yml`:
 ```
 
 ---
+
+## Backups
+
+Off-host backups to a Google Cloud Storage bucket. PG daily, CH events
+daily (current month) + monthly (frozen, never deleted), CH persons
+weekly. Retention is set by `docker/backup/lifecycle.json` — see
+[`docker/backup/README.md`](docker/backup/README.md) for the full
+operator manual (restore runbook, schedule editing, key rotation, DR
+sequence, what isn't covered).
+
+### Enable
+
+1. Create a GCS bucket and an HMAC key pair (Cloud Console → *Storage*
+   → *Settings* → *Interoperability*). Grant `roles/storage.objectAdmin`
+   on the bucket to the SA backing the HMAC.
+2. Add to `.env`:
+
+   ```bash
+   GCS_BUCKET=gs://my-posthog-backups
+   GCS_HMAC_KEY=GOOG1...
+   GCS_HMAC_SECRET=...
+   COMPOSE_PROFILES=backup        # or e.g. cdp,backup
+   ```
+3. Apply the bucket lifecycle (one-shot, replaces existing policy):
+
+   ```bash
+   gcloud storage buckets update gs://my-posthog-backups \
+       --lifecycle-file=docker/backup/lifecycle.json
+   ```
+4. Build and start:
+
+   ```bash
+   docker compose up -d --build backup
+   ```
+
+First PG dump fires at the next 02:00 UTC tick. Force one immediately
+to verify wiring:
+
+```bash
+docker compose exec backup /usr/local/bin/backup-scripts/backup-pg.sh
+```
+
+### Verify it's working
+
+```bash
+docker compose logs -f backup                                                      # live tail
+docker compose exec backup /usr/local/bin/backup-scripts/status.sh                 # local sentinels
+docker compose exec backup /usr/local/bin/backup-scripts/verify.sh                 # GCS-side
+docker compose ps backup                                                           # healthcheck
+```
+
+### Restore / disaster recovery
+
+See [`docker/backup/README.md`](docker/backup/README.md). All restores
+are in-place destructive; stop dependent services first
+(`temporal` and `cyclotron-janitor` included) and the scripts will
+prompt for explicit `YES` confirmation.
+
+> **`.env` is NOT backed up by this stack.** Keep an out-of-band copy
+> (password manager, separate encrypted bucket, `git-crypt`'d repo).
+> Losing the host AND the `.env` simultaneously means the GCS backups
+> are unrecoverable.
+
+---

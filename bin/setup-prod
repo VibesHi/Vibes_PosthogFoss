@@ -694,6 +694,58 @@ phase_apply_ttls() {
 }
 
 # ============================================================================
+# Phase 11: Backup config soft-warn (non-blocking)
+# ============================================================================
+#
+# The `backup` profile (docker-compose.prod.yml) ships off-host backups to
+# GCS. It's opt-in because it requires real GCS credentials (HMAC keys +
+# bucket) that we can't auto-provision. Three failure modes worth catching
+# at setup-time rather than discovering 90 days later when you actually
+# need to restore:
+#
+#   1. Profile not enabled → no backups happening at all.
+#   2. Profile enabled but GCS_* vars missing/empty → container crash-loops.
+#   3. Profile enabled + GCS_* set but lifecycle.json never applied →
+#      bucket grows unbounded (no cost ceiling, deleted backups never
+#      expire). We can detect (1) and (2) here; (3) requires a live GCS
+#      call which needs the user's gcloud auth, so we just remind.
+#
+# Non-blocking by design: backups are critical but configuring them is the
+# operator's call, not a setup-prod responsibility.
+
+phase_check_backup_config() {
+    local profiles="${COMPOSE_PROFILES:-}"
+    if [[ ",${profiles}," != *",backup,"* ]]; then
+        warn ""
+        warn "==================================================================="
+        warn "BACKUPS NOT CONFIGURED. You currently have NO off-host disaster"
+        warn "recovery. Enable with:"
+        warn "  1. Edit .env, set GCS_BUCKET / GCS_HMAC_KEY / GCS_HMAC_SECRET"
+        warn "  2. Add 'backup' to COMPOSE_PROFILES (e.g. COMPOSE_PROFILES=backup)"
+        warn "  3. docker compose up -d --build backup"
+        warn "  4. Apply bucket lifecycle: see README.prod.md '## Backups'"
+        warn "==================================================================="
+        return 0
+    fi
+
+    local missing=""
+    for var in GCS_BUCKET GCS_HMAC_KEY GCS_HMAC_SECRET; do
+        if [ -z "${!var:-}" ]; then
+            missing="$missing $var"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        warn "backup profile enabled but .env is missing:${missing}"
+        warn "Fill these in or remove 'backup' from COMPOSE_PROFILES."
+        return 0
+    fi
+
+    log "Backup profile enabled and GCS_* vars present. Reminder: ensure the"
+    log "bucket lifecycle policy from docker/backup/lifecycle.json has been"
+    log "applied at least once (see README.prod.md '## Backups')."
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -716,6 +768,8 @@ fi
 
 ttl_failures=0
 phase_apply_ttls || ttl_failures=$?
+
+phase_check_backup_config
 
 if [ "$ttl_failures" -eq 0 ]; then
     log "All phases complete. Tail logs with: docker compose logs -f web worker"

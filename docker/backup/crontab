@@ -1,0 +1,42 @@
+# PostHog backup schedule -- runs inside the `backup` container.
+#
+# All times UTC (TZ env var below). Stagger by 30 min between jobs so a slow
+# PG dump doesn't overlap with the daily ClickHouse BACKUP and starve CH of IO.
+#
+# `flock -n` prevents re-entry: if a previous run is still going (e.g. a
+# huge frozen-month freeze hits the 30-min curl timeout and is still polling
+# system.backups), the new tick is skipped silently rather than queuing up.
+#
+# 2>&1 routes script stderr to crond stdout, which crond -f forwards to PID-1
+# stdout, which docker captures into `docker compose logs backup`.
+#
+# Edit and rebuild the image after changing this file:
+#   docker compose build backup && docker compose up -d backup
+
+TZ=UTC
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# minute hour dom mon dow command
+
+# Postgres: daily 02:00 UTC, ~30s on a small install. Streams gzipped
+# pg_dumpall straight to GCS via `aws s3 cp -`.
+0 2 * * *   flock -n /tmp/pg.lock         /usr/local/bin/backup-scripts/backup-pg.sh                     2>&1
+
+# ClickHouse current month: daily 03:30 UTC, ~5min. Backs up only the
+# CURRENT toYYYYMM(timestamp) partition of sharded_events; old months
+# are immutable and don't need re-uploading.
+30 3 * * *  flock -n /tmp/ch-current.lock /usr/local/bin/backup-scripts/backup-ch-current-month.sh       2>&1
+
+# ClickHouse freeze previous month: 1st of month @ 04:00 UTC. Idempotent --
+# skips if the frozen artifact already exists in GCS. Once a YYYYMM.zip
+# lands in clickhouse/events/frozen/, we NEVER overwrite or delete it.
+0 4 1 * *   flock -n /tmp/ch-freeze.lock  /usr/local/bin/backup-scripts/backup-ch-freeze-last-month.sh   2>&1
+
+# ClickHouse persons + everything-except-events: Sunday 04:30 UTC, ~10min.
+# Excludes sharded_events (handled separately above) and TTL'd system_log
+# tables (rebuildable / disposable).
+30 4 * * 0  flock -n /tmp/ch-persons.lock /usr/local/bin/backup-scripts/backup-ch-persons.sh             2>&1
+
+# crond REQUIRES a trailing newline -- empty line below is intentional.
+

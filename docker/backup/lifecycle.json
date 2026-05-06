@@ -1,0 +1,38 @@
+{
+    "lifecycle": {
+        "rule": [
+            {
+                "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+                "condition": { "age": 7, "matchesPrefix": ["postgres/"] }
+            },
+            {
+                "action": { "type": "SetStorageClass", "storageClass": "COLDLINE" },
+                "condition": { "age": 30, "matchesPrefix": ["postgres/"] }
+            },
+            {
+                "action": { "type": "Delete" },
+                "condition": { "age": 90, "matchesPrefix": ["postgres/"] }
+            },
+            {
+                "action": { "type": "Delete" },
+                "condition": { "age": 3, "matchesPrefix": ["clickhouse/events/current/"] }
+            },
+            {
+                "action": { "type": "SetStorageClass", "storageClass": "COLDLINE" },
+                "condition": { "age": 60, "matchesPrefix": ["clickhouse/events/frozen/"] }
+            },
+            {
+                "action": { "type": "SetStorageClass", "storageClass": "ARCHIVE" },
+                "condition": { "age": 365, "matchesPrefix": ["clickhouse/events/frozen/"] }
+            },
+            {
+                "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+                "condition": { "age": 28, "matchesPrefix": ["clickhouse/persons-weekly/"] }
+            },
+            {
+                "action": { "type": "Delete" },
+                "condition": { "age": 56, "matchesPrefix": ["clickhouse/persons-weekly/"] }
+            }
+        ]
+    }
+}

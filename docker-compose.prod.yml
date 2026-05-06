@@ -1207,6 +1207,76 @@ services:
             kafka-init:
                 condition: service_completed_successfully
 
+    # Off-host backups to GCS. Gated behind the `backup` profile -- enable
+    # with COMPOSE_PROFILES=backup in .env (or `docker compose --profile
+    # backup up -d backup`). See README.prod.md "## Backups" for the full
+    # operator guide (initial setup, lifecycle apply, restore runbook,
+    # key rotation).
+    #
+    # Auth: HMAC interop credentials only (GCS_HMAC_KEY / GCS_HMAC_SECRET in
+    # .env). One pair satisfies both `aws s3` (PG dump uploads) and
+    # ClickHouse `BACKUP TO S3()`. No SA JSON, no metadata server, no extra
+    # mounts. Same operational model as the existing OBJECT_STORAGE_PASSWORD
+    # / CLICKHOUSE_PASSWORD pattern.
+    #
+    # Operator entry points (run from the host):
+    #   docker compose logs -f backup
+    #   docker compose exec backup /usr/local/bin/backup-scripts/status.sh
+    #   docker compose exec backup /usr/local/bin/backup-scripts/verify.sh
+    #   docker compose exec -it backup /usr/local/bin/backup-scripts/restore-pg.sh
+    backup:
+        profiles: [backup]
+        # mem-storage (384m) not mem-tiny (256m): aws-cli is Python (~80MB
+        # baseline) and its multipart upload buffers up to ~80MB across
+        # concurrent chunks during `cp -` from stdin. With pg_dumpall +
+        # gzip in the same pipeline, peak RSS during a multi-GB PG dump
+        # crowds 256m. 384m gives ~150% headroom.
+        <<: [*restart-prod, *mem-storage]
+        image: posthog-backup
+        build:
+            context: ./docker/backup
+        container_name: posthog_backup
+        logging: *default-logging
+        environment:
+            <<: *pg-env
+            # Required CH creds (same as worker / web).
+            CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+            CLICKHOUSE_HOST: clickhouse
+            CLICKHOUSE_PORT_HTTP: 8123
+            # GCS HMAC pair -- must be created in Cloud Console under
+            # Storage > Settings > Interoperability > Create access key for
+            # service account. The SA needs roles/storage.objectAdmin on
+            # the bucket (Create + Read + Delete; the last is needed for
+            # the lifecycle rule to do its job). See README.prod.md.
+            GCS_BUCKET:        ${GCS_BUCKET}
+            GCS_HMAC_KEY:      ${GCS_HMAC_KEY}
+            GCS_HMAC_SECRET:   ${GCS_HMAC_SECRET}
+            GCS_REGION:        ${GCS_REGION:-auto}
+            TZ: UTC
+        volumes:
+            # Sentinel files (last-ok timestamps + pre-restore snapshots).
+            # Kept in a named volume so they survive `docker compose up
+            # --force-recreate backup` for image rebuilds.
+            - posthog_backup_state:/var/run/backup
+        healthcheck:
+            test: ["CMD", "/usr/local/bin/backup-scripts/healthcheck.sh"]
+            interval: 1h
+            timeout: 30s
+            retries: 1
+            # Don't go unhealthy until the first expected run is overdue.
+            # Frozen-month sentinel won't appear for ~30d on a fresh deploy
+            # but healthcheck.sh has its own grace logic; this start_period
+            # just suppresses the first cycle of "starting -> unhealthy".
+            start_period: 36h
+        depends_on:
+            db:
+                condition: service_healthy
+            clickhouse:
+                # CH has no Compose-level healthcheck in base.yml. `started`
+                # is the strictest condition we can express here -- the
+                # backup scripts retry-tolerate CH being mid-startup.
+                condition: service_started
+
 volumes:
     zookeeper-data:
     zookeeper-datalog:
@@ -1220,3 +1290,6 @@ volumes:
     redis7-data:
     kafka-data:
     redpanda-data:
+    # Backup container state: last-ok sentinels + pre-restore snapshots.
+    # Created/used only when the `backup` profile is active.
+    posthog_backup_state:
