@@ -71,6 +71,6 @@ status=$(ch_query "SELECT status FROM system.backups WHERE name LIKE '%${LAST_MO
     || die "Freeze BACKUP ended in status='${status}'"
 
 # Final size for the log -- useful for capacity-planning the bucket budget.
-size_bytes=$(aws_gcs ls --summarize "$(s3_uri "$KEY")" | awk '/^Total Size:/ {print $3; exit}')
+size_bytes=$(aws_gcs ls --summarize "$(s3_uri "$KEY")" | awk '/Total Size:/ {print $3; exit}')
 log "Frozen ${LAST_MONTH}: $(numfmt --to=iec --suffix=B "${size_bytes:-0}")"
 ok ch-freeze

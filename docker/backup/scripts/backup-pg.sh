@@ -43,7 +43,7 @@ PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
 # Verify the upload landed and is at least 1 KB. Catches the silent-failure
 # mode where pg_dumpall produces no output (e.g. role permission issue) but
 # `gzip` and `aws s3` still succeed on an empty stream.
-size_bytes=$(aws_gcs ls --summarize "${DEST}" | awk '/^Total Size:/ {print $3; exit}')
+size_bytes=$(aws_gcs ls --summarize "${DEST}" | awk '/Total Size:/ {print $3; exit}')
 if [ "${size_bytes:-0}" -lt 1024 ]; then
     die "Uploaded dump is suspiciously small (${size_bytes:-0} bytes). Inspect with: aws --endpoint-url=https://storage.googleapis.com s3 ls ${DEST}"
 fi

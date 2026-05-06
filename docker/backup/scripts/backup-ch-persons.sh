@@ -63,6 +63,6 @@ status=$(ch_query "SELECT status FROM system.backups WHERE name LIKE '%${TS}.zip
 [ "$status" = "BACKUP_CREATED" ] \
     || die "BACKUP ended in status='${status}'"
 
-size_bytes=$(aws_gcs ls --summarize "$(s3_uri "$KEY")" | awk '/^Total Size:/ {print $3; exit}')
+size_bytes=$(aws_gcs ls --summarize "$(s3_uri "$KEY")" | awk '/Total Size:/ {print $3; exit}')
 log "Persons backup completed: $(numfmt --to=iec --suffix=B "${size_bytes:-0}")"
 ok ch-persons

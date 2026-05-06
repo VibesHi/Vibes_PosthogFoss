@@ -1239,6 +1239,12 @@ services:
         logging: *default-logging
         environment:
             <<: *pg-env
+            # *pg-env exposes PGPASSWORD + DATABASE_URLs but NOT the raw
+            # POSTHOG_DB_PASSWORD (because app services consume the URLs).
+            # Backup scripts use both pg_dumpall (PGPASSWORD) AND psql
+            # checks (need raw password to construct ad-hoc connections),
+            # so re-expose it explicitly here.
+            POSTHOG_DB_PASSWORD: ${POSTHOG_DB_PASSWORD}
             # Required CH creds (same as worker / web).
             CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
             CLICKHOUSE_HOST: clickhouse
