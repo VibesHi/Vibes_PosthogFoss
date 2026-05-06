@@ -51,13 +51,22 @@ DEFAULTS = {
     # resolve via KAFKA_TOPIC_MAIN / KAFKA_TOPIC_HISTORICAL / KAFKA_TOPIC_OVERFLOW
     # env vars on the worker (set in docker-compose.prod.yml).
     "KAFKA_TOPIC_ALIAS": "historical",
-    # 80000 events/sec sustained — empirically safe with the default 4-replica
-    # `ingestion-general` consumer (each replica handles ~10–20k events/sec from
-    # `events_plugin_ingestion_historical`, so aggregate ceiling is ~40–80k).
-    # Pushing higher just builds Kafka lag (durable, fine for one-shot import,
-    # but masks real bottleneck). Override per-job with KAFKA_SEND_RATE env or
-    # --kafka-send-rate. Lower if downstream lag grows unbounded.
-    "KAFKA_SEND_RATE": "80000",
+    # 3000 events/sec — paced to match what 4 default-config ingestion-general
+    # replicas can actually drain from events_plugin_ingestion_historical
+    # (~750-1000 events/sec per replica with CONSUMER_MAX_BACKGROUND_TASKS=1
+    # and CONSUMER_BATCH_SIZE=500, summing to ~3-4k aggregate). Higher rates
+    # build Kafka lag faster than consumers drain, and on a 6h-retention
+    # cluster that lag GETS DELETED before consumption — that's how the first
+    # March attempt lost 144k events on partition 0. See RUNBOOK "lessons
+    # learned" section.
+    #
+    # If you bump retention to 7d AND tune consumers (CONSUMER_MAX_BACKGROUND_TASKS=4,
+    # CONSUMER_BATCH_SIZE=2000, replicas=6, partitions>=6) you can safely raise
+    # this to ~15-20k. Otherwise leave it at 3000 — slow-and-correct beats
+    # fast-and-lossy.
+    #
+    # Override per-job with KAFKA_SEND_RATE env or --kafka-send-rate.
+    "KAFKA_SEND_RATE": "3000",
     "KAFKA_TXN_TIMEOUT_S": "60",
     "MIXPANEL_TIMESTAMP_OFFSET_SECONDS": "0",
     "MIXPANEL_SKIP_NO_DISTINCT_ID": "false",
