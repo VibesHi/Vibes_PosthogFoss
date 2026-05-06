@@ -231,9 +231,20 @@ else
         done <<<"$ch_out"
 
         # ---- Source counts (parallel gsutil) ----
-        files=$(gsutil ls "gs://${GCS_BUCKET}/${GCS_PREFIX}/${month}-*.jsonl.gz" 2>/dev/null || true)
+        # Try two layout conventions before giving up:
+        #   (a) ${GCS_PREFIX}/${month}-*.jsonl.gz  e.g. mixpanel-daily/2024-03-*.jsonl.gz
+        #   (b) ${month//-//}/${month}-*.jsonl.gz  e.g. 2024/03/2024-03-*.jsonl.gz
+        # (b) is the worker-friendly hierarchy used by the splitter for new months.
+        month_path="${month//-//}"  # 2024-03 -> 2024/03
+        glob_a="gs://${GCS_BUCKET}/${GCS_PREFIX}/${month}-*.jsonl.gz"
+        glob_b="gs://${GCS_BUCKET}/${month_path}/${month}-*.jsonl.gz"
+        files=$(gsutil ls "$glob_a" 2>/dev/null || true)
         if [[ -z "$files" ]]; then
-            warn "no GCS files matched gs://${GCS_BUCKET}/${GCS_PREFIX}/${month}-*.jsonl.gz"
+            files=$(gsutil ls "$glob_b" 2>/dev/null || true)
+        fi
+        if [[ -z "$files" ]]; then
+            fail "no GCS files matched either layout: '$glob_a' or '$glob_b'. Set GCS_PREFIX explicitly if your layout differs."
+            mark_fail
             continue
         fi
 
