@@ -91,7 +91,11 @@ gcs_object_exists "$(s3_uri "$KEY")" \
     || die "Source key not found in GCS: $(s3_uri "$KEY")"
 
 # --- pre-restore freeze (in-place rollback path) -----------------------------
-FREEZE_NAME="pre-restore-${PARTITION}-$(date -u +%Y%m%dT%H%M%SZ)"
+# Use underscores, not hyphens: CH 22.3+ URL-encodes special chars in the
+# on-disk shadow path, so `WITH NAME 'pre-restore-...'` becomes a directory
+# named `pre%2Drestore%2D...` -- which makes the cleanup `rm -rf` we print
+# below not match the actual path. Underscores survive the encoding intact.
+FREEZE_NAME="pre_restore_${PARTITION}_$(date -u +%Y%m%dT%H%M%SZ)"
 log "Freezing current partition ${PARTITION} as '${FREEZE_NAME}' (rollback hardlinks under /var/lib/clickhouse/shadow/)"
 ch_query "ALTER TABLE posthog.sharded_events FREEZE PARTITION ID '${PARTITION}' WITH NAME '${FREEZE_NAME}'" \
     >/dev/null \

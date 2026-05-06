@@ -219,16 +219,27 @@ docker compose exec -it backup /usr/local/bin/backup-scripts/restore-ch-events.s
 
 The restore script runs `ALTER TABLE … FREEZE PARTITION ID '…'` BEFORE
 dropping the partition. The freeze creates hardlinks under
-`/var/lib/clickhouse/shadow/pre-restore-<PARTITION>-<TS>/` (cheap, no
+`/var/lib/clickhouse/shadow/pre_restore_<PARTITION>_<TS>/` (cheap, no
 copy) and gives you an in-place rollback path: re-attach those parts
 manually via `ALTER TABLE … ATTACH PART …` if the restore is wrong.
+
+> Underscores in the path are deliberate: CH 22.3+ URL-encodes
+> hyphens in shadow directory names (`pre-restore-…` would land on
+> disk as `pre%2Drestore%2D…`), which makes the `rm -rf` below
+> miss. Underscores survive untouched.
 
 After verifying the restore, clean up the freeze from the host:
 
 ```bash
 # The script prints the exact freeze name on success -- e.g.
-# pre-restore-202604-20260506T120000Z. Substitute below.
-docker compose exec clickhouse rm -rf /var/lib/clickhouse/shadow/pre-restore-202604-20260506T120000Z/
+# pre_restore_202604_20260506T120000Z. Substitute below.
+docker compose exec clickhouse rm -rf /var/lib/clickhouse/shadow/pre_restore_202604_20260506T120000Z/
+
+# Bulk-clean ALL pre-restore freezes (both legacy URL-encoded
+# pre%2Drestore%2D... and current pre_restore_... names; preserves
+# CH's own increment.txt counter):
+docker compose exec clickhouse sh -c \
+    'rm -rf /var/lib/clickhouse/shadow/pre%2Drestore%2D* /var/lib/clickhouse/shadow/pre_restore_*'
 ```
 
 > **Why `rm -rf`, not `SYSTEM UNFREEZE`?** Recent CH builds may disable
