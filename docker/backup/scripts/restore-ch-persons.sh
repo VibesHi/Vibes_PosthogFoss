@@ -76,34 +76,68 @@ log "Source: ${SRC_HTTP}"
 
 # --- enumerate tables we'll drop ---------------------------------------------
 # Use FORMAT TabSeparated -> one table name per line, no quoting.
+#
+# Dictionaries (engine='Dictionary') hold a hard dependency on their source
+# tables -- CH refuses `DROP TABLE` on a source while a dictionary still
+# references it (HAVE_DEPENDENT_OBJECTS, code 630). MaterializedViews,
+# Distributed, and Buffer engines don't have this problem.
+#
+# Two-phase drop: dictionaries first, then everything else. This works
+# regardless of alphabetical name ordering between the source and the dict.
 log "Enumerating posthog DB tables that are in the backup's scope..."
+DICTS_TO_DROP=$(ch_query "SELECT name FROM system.tables
+                          WHERE database='posthog'
+                            AND engine='Dictionary'
+                            AND name NOT IN ${EXCEPT_TABLES_SQL}
+                          ORDER BY name
+                          FORMAT TabSeparated")
 TABLES_TO_DROP=$(ch_query "SELECT name FROM system.tables
                            WHERE database='posthog'
+                             AND engine != 'Dictionary'
                              AND name NOT IN ${EXCEPT_TABLES_SQL}
                            ORDER BY name
                            FORMAT TabSeparated")
+dict_count=$(echo "$DICTS_TO_DROP" | grep -c . || true)
 table_count=$(echo "$TABLES_TO_DROP" | grep -c . || true)
-[ "$table_count" -gt 0 ] || die "No tables to drop in posthog DB. Is CH up? Is the database empty? Inspect 'docker compose logs clickhouse'."
+total=$((dict_count + table_count))
+[ "$total" -gt 0 ] || die "No tables to drop in posthog DB. Is CH up? Is the database empty? Inspect 'docker compose logs clickhouse'."
 
-log "Will drop ${table_count} table(s):"
+log "Will drop ${dict_count} dictionar(ies) + ${table_count} table(s) = ${total} object(s)."
+log "Sample tables:"
 echo "$TABLES_TO_DROP" | sed 's/^/    /' | head -n 30
 if [ "$table_count" -gt 30 ]; then
-    log "  ... and $((table_count - 30)) more"
+    log "  ... and $((table_count - 30)) more tables"
+fi
+if [ "$dict_count" -gt 0 ]; then
+    log "Dictionaries (dropped first):"
+    echo "$DICTS_TO_DROP" | sed 's/^/    /'
 fi
 
 # --- confirmation prompt -----------------------------------------------------
-confirm_destructive "About to DROP the ${table_count} tables listed above and
+confirm_destructive "About to DROP the ${total} objects listed above and
 RESTORE them from ${SRC_HTTP}.
 
 EXCLUDED (NOT touched): sharded_events, session_replay, app_metrics(_2),
 log_entries, query_log_archive, ingestion_warnings, writable_events, events_recent.
 
 This is IN-PLACE on the LIVE ClickHouse instance. There is NO rollback path
-once DROP runs -- if RESTORE fails after DROP, the affected tables will be
+once DROP runs -- if RESTORE fails after DROP, the affected objects will be
 GONE until you re-run with a working source."
 
-# --- drop ---------------------------------------------------------------------
-log "Dropping tables..."
+# --- drop dictionaries first -------------------------------------------------
+# Must drop dictionaries before their source tables. CH refuses to DROP TABLE
+# while a Dictionary engine still references it (HAVE_DEPENDENT_OBJECTS).
+if [ "$dict_count" -gt 0 ]; then
+    log "Dropping ${dict_count} dictionar(ies)..."
+    while IFS= read -r dict; do
+        [ -n "$dict" ] || continue
+        ch_query "DROP DICTIONARY IF EXISTS posthog.\`${dict}\` SYNC" >/dev/null \
+            || die "DROP DICTIONARY posthog.${dict} failed -- DB is now in an inconsistent state. Re-run RESTORE from ${SRC_HTTP} to recover."
+    done <<< "$DICTS_TO_DROP"
+fi
+
+# --- drop remaining tables ----------------------------------------------------
+log "Dropping ${table_count} table(s)..."
 while IFS= read -r tbl; do
     [ -n "$tbl" ] || continue
     ch_query "DROP TABLE IF EXISTS posthog.\`${tbl}\` SYNC" >/dev/null \
@@ -123,5 +157,5 @@ status=$(ch_query "SELECT status FROM system.backups ORDER BY start_time DESC LI
 restored_count=$(ch_query "SELECT count() FROM system.tables
                            WHERE database='posthog'
                              AND name NOT IN ${EXCEPT_TABLES_SQL}" | tr -d '[:space:]')
-log "Restore complete. ${restored_count} tables restored (was ${table_count} before drop)."
+log "Restore complete. ${restored_count} tables/dictionaries present (was ${total} before drop)."
 ok restore-ch-persons
