@@ -51,22 +51,26 @@ DEFAULTS = {
     # resolve via KAFKA_TOPIC_MAIN / KAFKA_TOPIC_HISTORICAL / KAFKA_TOPIC_OVERFLOW
     # env vars on the worker (set in docker-compose.prod.yml).
     "KAFKA_TOPIC_ALIAS": "historical",
-    # 3000 events/sec — paced to match what 4 default-config ingestion-general
-    # replicas can actually drain from events_plugin_ingestion_historical
-    # (~750-1000 events/sec per replica with CONSUMER_MAX_BACKGROUND_TASKS=1
-    # and CONSUMER_BATCH_SIZE=500, summing to ~3-4k aggregate). Higher rates
-    # build Kafka lag faster than consumers drain, and on a 6h-retention
-    # cluster that lag GETS DELETED before consumption — that's how the first
-    # March attempt lost 144k events on partition 0. See RUNBOOK "lessons
-    # learned" section.
+    # 1500 events/sec — paced just below the EMPIRICALLY MEASURED ceiling of 4
+    # default-config ingestion-general replicas (~1700 events/sec aggregate, or
+    # ~425/sec per replica with CONSUMER_MAX_BACKGROUND_TASKS=1 + CONSUMER_BATCH_SIZE=500).
+    # Setting send_rate slightly below consumer ceiling keeps Kafka lag flat or
+    # decreasing, eliminating retention-loss risk entirely.
+    #
+    # Why this matters: on a 6h-retention cluster, lag that grows faster than
+    # consumers drain GETS DELETED before consumption. The first March attempt
+    # at 80,000/sec lost 144k events on partition 0 (10x the consumer ceiling
+    # → lag exceeded 6h × 1700/s = ~36M event buffer → retention purged it).
+    # See RUNBOOK "lessons learned" section.
     #
     # If you bump retention to 7d AND tune consumers (CONSUMER_MAX_BACKGROUND_TASKS=4,
-    # CONSUMER_BATCH_SIZE=2000, replicas=6, partitions>=6) you can safely raise
-    # this to ~15-20k. Otherwise leave it at 3000 — slow-and-correct beats
-    # fast-and-lossy.
+    # CONSUMER_BATCH_SIZE=2000, replicas=6, partitions>=6), you can safely raise
+    # this to ~15-20k. Otherwise leave it at 1500 — slow-and-correct beats
+    # fast-and-lossy. Confirm consumer drain rate empirically with rps.sh
+    # BEFORE raising this past 1500.
     #
     # Override per-job with KAFKA_SEND_RATE env or --kafka-send-rate.
-    "KAFKA_SEND_RATE": "3000",
+    "KAFKA_SEND_RATE": "1500",
     "KAFKA_TXN_TIMEOUT_S": "60",
     "MIXPANEL_TIMESTAMP_OFFSET_SECONDS": "0",
     "MIXPANEL_SKIP_NO_DISTINCT_ID": "false",
