@@ -584,8 +584,10 @@ docker compose ps backup                                                        
 
 See [`docker/backup/README.md`](docker/backup/README.md). All restores
 are in-place destructive; stop dependent services first
-(`temporal` and `cyclotron-janitor` included) and the scripts will
-prompt for explicit `YES` confirmation.
+(`temporal`, `cyclotron-janitor`, and `batch-import-worker` included)
+and the scripts will prompt for explicit `YES` confirmation. Restore
+scripts hard-refuse if active connections are detected — they print
+the exact stop command and exit non-zero rather than corrupting state.
 
 > **`.env` is NOT backed up by this stack.** Keep an out-of-band copy
 > (password manager, separate encrypted bucket, `git-crypt`'d repo).

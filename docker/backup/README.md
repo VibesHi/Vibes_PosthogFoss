@@ -22,6 +22,7 @@ deliberate trade-offs, and what isn't covered.
 | `scripts/restore-pg.sh`         | In-place destructive PG restore (with auto pre-restore snapshot)     |
 | `scripts/restore-ch-events.sh`  | In-place destructive partition restore (with auto FREEZE rollback)   |
 | `scripts/restore-ch-persons.sh` | In-place destructive drop+restore (no merge — rewinds to backup)     |
+| `scripts/cleanup-restore-rollbacks.sh` | Daily: ages out PG pre-restore snapshots > 7d                 |
 | `scripts/status.sh`             | Local sentinel summary table                                         |
 | `scripts/verify.sh`             | GCS-side manifest validation (size + age)                            |
 | `scripts/healthcheck.sh`        | `docker compose ps` healthcheck (per-job grace windows)              |
@@ -86,19 +87,87 @@ docker compose exec clickhouse clickhouse-client \
 
 All restores are **in-place destructive** on the live PG/CH instances.
 Stop dependent services first or expect crash-loops during the restore.
+Restore scripts now hard-refuse to run when active dependents are detected
+(see [Pre-flight refusals](#pre-flight-refusals)) — stop the listed
+services and re-run.
+
+### Pre-restore data sanity (capture before/after for comparison)
+
+Restore scripts are destructive — there is no automatic dry-run. To
+catch a bad backup BEFORE bringing services back, capture stable
+fingerprints of the current data so you can diff them post-restore:
+
+```bash
+# Convenience: read CH password once.
+CH_PWD=$(grep ^CLICKHOUSE_PASSWORD .env | cut -d= -f2-)
+
+# PG: exact counts on a few critical tables (n_live_tup is an autovacuum
+# estimate that drifts; count(*) is the source of truth).
+: > /tmp/before-pg-counts.txt
+for t in posthog_team posthog_user posthog_dashboard posthog_featureflag posthog_organization; do
+    n=$(docker compose exec -T db psql -U posthog -d posthog -tAc "SELECT count(*) FROM $t")
+    echo "$t $n" >> /tmp/before-pg-counts.txt
+done
+
+# CH events. sharded_events is ReplicatedReplacingMergeTree -- plain
+# count() drifts as background dedup merges run, so it's not a reliable
+# fingerprint. Use uniqExact(uuid) (stable across merges, since uuid is
+# the dedup key) or count() FINAL (exact but expensive on large tables).
+docker compose exec -T clickhouse clickhouse-client --password="$CH_PWD" --query "
+    SELECT toYYYYMM(timestamp) AS m,
+           uniqExact(uuid) AS uniq_events
+    FROM posthog.sharded_events
+    WHERE timestamp >= now() - INTERVAL 90 DAY
+    GROUP BY m ORDER BY m" > /tmp/before-ch-events.tsv
+
+# CH persons. Also Replacing -- same uniqExact rule. id / person_id /
+# distinct_id are the natural dedup keys for these tables.
+docker compose exec -T clickhouse clickhouse-client --password="$CH_PWD" --query "
+    SELECT 'person'   AS t, uniqExact(id)          AS n FROM posthog.person UNION ALL
+    SELECT 'pdid'     AS t, uniqExact(distinct_id) AS n FROM posthog.person_distinct_id2 UNION ALL
+    SELECT 'override' AS t, uniqExact(person_id)   AS n FROM posthog.person_overrides
+    " > /tmp/before-ch-persons.tsv
+```
+
+After restore, re-run the same queries into `/tmp/after-*` and `diff`.
+The expected delta depends on what you restored:
+
+| Restore target | AFTER vs BEFORE |
+|---|---|
+| Closed-month CH partition (e.g. `restore-ch-events.sh 202604`) | Exact match — closed months don't get new ingestion. |
+| Current-month CH partition (`restore-ch-events.sh 202605 current`) | AFTER ≤ BEFORE by the events ingested between backup time and restore time. |
+| CH persons | AFTER ≤ BEFORE by the person events processed since the backup. |
+| PG full cluster | Exact match against the most-recent backup; older backups will be off by everything written since. |
+
+A delta LARGER than expected means either the backup is older than you
+thought, or a table was missing from the backup scope (check the
+`EXCEPT` clause in `backup-ch-persons.sh` and the dump output of
+`backup-pg.sh`).
+
+### Pre-flight refusals
+
+Restore scripts now hard-refuse (exit non-zero, no destructive ops
+performed) on these conditions. Fix the listed cause, re-run.
+
+| Refusal | Cause | Fix |
+|---|---|---|
+| `Refusing to proceed with N active connection(s).` (restore-pg.sh) | A web/worker/ingestion service is still connected to the `posthog` PG database. | Run the printed `docker compose stop …` block. Re-run. |
+| `Orphan database(s) with Dictionary tables detected: posthog_verify` (restore-ch-persons.sh) | A previous AS-clause restore drill (e.g. `RESTORE … AS posthog_verify`) left orphan tables behind. The orphan Dictionary engines may reference `posthog.*` source tables and would block `DROP TABLE` on the live tables during restore. | The script prints the exact `DROP DATABASE …` command for each orphan DB. Run those, re-run the restore. |
+| `Source key not found in GCS: …` (any restore script) | Typo in the s3 key, or the lifecycle policy aged the artifact out. | List candidates: `docker compose exec -T backup bash -c "source /usr/local/bin/backup-scripts/_lib.sh && aws_gcs ls $(s3_uri postgres/)"`. Re-run with a valid key. |
 
 ### Postgres (full cluster)
 
 ```bash
-# 1. Stop everything that talks to PG (including `temporal` itself,
-#    which holds its own connections, and cyclotron-janitor under cdp).
+# 1. Stop everything that talks to PG (including `temporal` itself, which
+#    holds its own connections, cyclotron-janitor under cdp, and
+#    batch-import-worker which long-polls posthog_batchimport).
 docker compose stop \
     web worker temporal-django-worker temporal plugins \
     ingestion-general ingestion-sessionreplay ingestion-error-tracking \
     ingestion-logs ingestion-traces \
     recording-api hypercache-server \
     capture replay-capture property-defs-rs feature-flags cymbal \
-    cyclotron-janitor
+    cyclotron-janitor batch-import-worker
 
 # 2. Restore (defaults to the most recent PG dump in GCS).
 docker compose exec -it backup /usr/local/bin/backup-scripts/restore-pg.sh
@@ -120,10 +189,19 @@ docker compose exec -it backup bash -c '
     snap=$(ls -t /var/run/backup/pre-restore-pg-*.sql.gz | head -n 1)
     echo "Reverting from $snap"
     gunzip -c "$snap" \
+    | sed -E "/^DROP ROLE IF EXISTS posthog;\$/d; /^CREATE ROLE posthog;\$/d; /^ALTER ROLE posthog WITH /d" \
     | PGPASSWORD=$POSTHOG_DB_PASSWORD psql --set ON_ERROR_STOP=1 \
         -h db -U posthog -d postgres
 '
 ```
+
+The `sed` filter strips role-management statements for the connecting
+user — without it, the revert fails with `current user cannot be
+dropped` (chicken-and-egg, same as the forward-restore path).
+
+Snapshots > 7d old are auto-deleted by `cleanup-restore-rollbacks.sh`
+(daily 05:30 UTC). Adjust retention with `cleanup-restore-rollbacks.sh
+14` (or pass `--dry-run` to preview).
 
 ### ClickHouse `sharded_events` (single-month partition)
 
@@ -139,12 +217,32 @@ docker compose exec -it backup /usr/local/bin/backup-scripts/restore-ch-events.s
     202604 clickhouse/events/frozen/202604.zip
 ```
 
-The restore script `ALTER TABLE … FREEZE PARTITION ID '…'` BEFORE
+The restore script runs `ALTER TABLE … FREEZE PARTITION ID '…'` BEFORE
 dropping the partition. The freeze creates hardlinks under
 `/var/lib/clickhouse/shadow/pre-restore-<PARTITION>-<TS>/` (cheap, no
 copy) and gives you an in-place rollback path: re-attach those parts
-manually via `ALTER TABLE … ATTACH PART …` and clean the freeze with
-`SYSTEM UNFREEZE WITH NAME 'pre-restore-…'` once the restore is verified.
+manually via `ALTER TABLE … ATTACH PART …` if the restore is wrong.
+
+After verifying the restore, clean up the freeze from the host:
+
+```bash
+# The script prints the exact freeze name on success -- e.g.
+# pre-restore-202604-20260506T120000Z. Substitute below.
+docker compose exec clickhouse rm -rf /var/lib/clickhouse/shadow/pre-restore-202604-20260506T120000Z/
+```
+
+> **Why `rm -rf`, not `SYSTEM UNFREEZE`?** Recent CH builds may disable
+> it in stock configs (it can race with replication). `shadow/` is
+> operator-managed — CH never touches it autonomously — so plain
+> `rm -rf` is always safe.
+
+> **Restore latency note.** The backup format is `.zip` (single file,
+> single-stream RESTORE). On a 5–10 GB partition expect several minutes
+> of wall time depending on disk IO. A directory-format backup would
+> parallelize and finish faster, but `.zip` is preferred here for
+> simpler GCS lifecycle management (one object per partition) and
+> easier offline inspection. Trade-off accepted explicitly — slow
+> restore is recoverable, complicated lifecycle isn't.
 
 ### ClickHouse persons + everything-except-events
 
@@ -155,10 +253,11 @@ docker compose exec -it backup /usr/local/bin/backup-scripts/restore-ch-persons.
 The script enumerates every table in the `posthog` CH database that
 isn't in the EXCEPT list (events, session_replay, app_metrics,
 log_entries, query_log_archive, ingestion_warnings, writable_events,
-events_recent), DROPs them, then restores fresh from the backup. This
-is "REPLACE", not "MERGE" — old rows that aren't in the backup are
-gone. There is no rollback path once DROP runs; if RESTORE fails after
-DROP, re-run with a known-good source.
+events_recent), DROPs them (dictionaries first, then tables), then
+restores fresh from the backup. This is "REPLACE", not "MERGE" — old
+rows that aren't in the backup are gone. There is no rollback path
+once DROP runs; if RESTORE fails after DROP, re-run with a
+known-good source.
 
 Most CH metadata in this dump (person tables, sessions, channel_type,
 exchange_rate) is also derivable from PG via the personhog rebuild
@@ -166,6 +265,22 @@ path, so "restore PG first, then re-derive CH persons" is often
 cleaner than restoring this archive. Use this restore only when
 CH-side person tables are confirmed corrupt AND you can't or don't
 want to wait for the rebuild.
+
+> **Sandbox-restore (AS-clause) limitation.** The natural way to
+> "smoke-test" a persons backup without touching live data would be
+> `RESTORE DATABASE posthog AS posthog_verify FROM …`. **This does
+> not work** on a single-replica CH install: every ReplicatedMergeTree
+> table embeds a fixed ZooKeeper path (`/clickhouse/tables/{shard}/posthog/<table>`)
+> in its CREATE statement, and CH refuses to attach a second replica
+> at the same ZK path (`Replica already exists`). To restore-test
+> you'd need a separate CH instance with its own ZK ensemble.
+>
+> A failed AS-clause restore leaves orphan tables in `posthog_verify`
+> (Dictionary engines whose source clause still points at `posthog.*`).
+> The next `restore-ch-persons.sh` will refuse with `Orphan database(s)
+> with Dictionary tables detected …` until you
+> `DROP DATABASE posthog_verify SYNC` — see
+> [Pre-flight refusals](#pre-flight-refusals).
 
 ## Key rotation (GCS HMAC pair)
 
@@ -247,7 +362,9 @@ Order matters when rebuilding from zero:
    produced the backups — version mismatch is a top cause of restore
    failures.
 2. `bin/setup-prod` to bring up the empty stack with profile=backup.
-3. Stop dependents (the long `docker compose stop ...` line above).
+3. Stop dependents (the long `docker compose stop …` line in
+   [Postgres restore](#postgres-full-cluster), including
+   `batch-import-worker`).
 4. `restore-pg.sh latest`. Fast; gets you team IDs, persons (PG
    ground truth), dashboards, feature flag config back.
 5. `restore-ch-persons.sh latest`. Or skip and rely on personhog's

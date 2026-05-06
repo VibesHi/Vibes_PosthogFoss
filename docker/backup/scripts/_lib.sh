@@ -151,6 +151,7 @@ ch_wait_backup_done() {
 # from under live consumers. This includes:
 #   * `temporal` itself (uses POSTGRES_PWD against `db` for its own state)
 #   * `cyclotron-janitor` (cdp profile, uses CYCLOTRON_DATABASE_URL → `db`)
+#   * `batch-import-worker` (long-poll lease query against posthog_batchimport)
 # `docker compose stop` is no-op for services that aren't running, so it's
 # safe to list profile-gated ones unconditionally.
 print_stop_dependents_cmd() {
@@ -161,7 +162,7 @@ docker compose stop \
     ingestion-logs ingestion-traces \
     recording-api hypercache-server \
     capture replay-capture property-defs-rs feature-flags cymbal \
-    cyclotron-janitor
+    cyclotron-janitor batch-import-worker
 EOF
 }
 
@@ -169,6 +170,77 @@ print_start_dependents_cmd() {
     cat <<'EOF'
 docker compose up -d
 EOF
+}
+
+# --- pre-flight checks (called by restore scripts) ---------------------------
+#
+# These refuse to proceed when the system is in a state that will cause the
+# destructive restore to fail or corrupt data partway through. Each helper
+# prints the EXACT remediation command and dies. Operator runs the fix,
+# re-runs the restore.
+
+# True if any non-self backend is connected to the `posthog` PG database.
+# Used by restore-pg.sh.
+assert_pg_dependents_stopped() {
+    require_pg_creds
+    local active
+    if ! active=$(PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
+        psql -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" -d postgres -tAc \
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname='posthog' AND pid <> pg_backend_pid()
+               AND application_name NOT LIKE 'pg_%'"); then
+        die "Failed to connect to PG at ${PGHOST:-db} as ${PGUSER:-posthog} (db=postgres). Verify POSTHOG_DB_PASSWORD and that the db service is up."
+    fi
+    active=${active//[[:space:]]/}
+    if [ "${active:-0}" -gt 0 ]; then
+        warn "${active} active backend(s) on posthog DB. Restore would crash-loop them."
+        warn "Stop dependents from the HOST FIRST, then re-run this script:"
+        echo
+        print_stop_dependents_cmd
+        echo
+        warn "If a non-PostHog process is connected, find and stop it manually:"
+        warn "  docker compose exec -T db psql -U posthog -d postgres -c \\"
+        warn "    \"SELECT pid, application_name, client_addr FROM pg_stat_activity WHERE datname='posthog'\""
+        die "Refusing to proceed with ${active} active connection(s)."
+    fi
+}
+
+# Detect orphan parallel CH databases that hold Dictionary-engine tables.
+# Such DBs typically come from a failed `RESTORE DATABASE posthog AS
+# posthog_verify` attempt: the AS-clause restore creates Dictionaries in
+# the alias DB before failing on the first ReplicatedMergeTree (ZK path
+# collision), leaving orphan dicts whose source clause still points at
+# `DB 'posthog' TABLE '...'`. Those cross-DB refs block DROP TABLE on
+# the live `posthog.*` source tables in restore-ch-persons.sh
+# (HAVE_DEPENDENT_OBJECTS, code 630).
+#
+# Heuristic: any Dictionary in a non-system, non-`posthog` DB is suspect
+# in this stack. PostHog itself only creates dicts inside the `posthog`
+# DB. False positive (custom analytics DB with legit dicts) costs the
+# operator one DROP DATABASE; better than getting stuck mid-restore.
+assert_no_cross_db_dict_deps_on_posthog() {
+    local orphans
+    orphans=$(ch_query "SELECT DISTINCT database
+                        FROM system.tables
+                        WHERE engine='Dictionary'
+                          AND database NOT IN ('posthog','system','INFORMATION_SCHEMA','information_schema','default')
+                        ORDER BY database
+                        FORMAT TabSeparated")
+    if [ -n "$orphans" ]; then
+        warn "Orphan database(s) with Dictionary tables detected:"
+        while IFS= read -r db; do
+            [ -n "$db" ] || continue
+            warn "  - ${db}"
+        done <<< "$orphans"
+        warn "These will block DROP TABLE during restore. Drop them first:"
+        echo
+        while IFS= read -r db; do
+            [ -n "$db" ] || continue
+            echo "  docker compose exec -T backup bash -c 'source /usr/local/bin/backup-scripts/_lib.sh && ch_query \"DROP DATABASE IF EXISTS ${db} SYNC\"'"
+        done <<< "$orphans"
+        echo
+        die "Refusing to proceed with orphan Dictionary databases."
+    fi
 }
 
 # --- confirmation prompt -----------------------------------------------------

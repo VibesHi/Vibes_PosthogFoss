@@ -19,11 +19,14 @@
 #
 # Safety net: before importing, dumps the CURRENT live PG state to
 # /var/run/backup/pre-restore-pg-<TS>.sql.gz inside the container's volume.
-# If the restore is wrong, you can revert with `gunzip -c ... | psql`.
+# The exact revert command is logged at runtime (it requires the same
+# `sed` role-filter as the forward path -- see docker/backup/README.md
+# §"Postgres (full cluster)" or just copy the line that follows
+# "Snapshotting current PG state -> ..." in this script's output).
 #
 # This script does NOT touch other services. It will REFUSE to run if it
-# detects active web/worker connections (those services need to be stopped
-# first to prevent crash-loops during the restore).
+# detects active backends on the `posthog` PG database (those services
+# need to be stopped first to prevent crash-loops during the restore).
 
 SCRIPT_NAME=restore-pg
 # shellcheck source=_lib.sh
@@ -60,30 +63,12 @@ gcs_object_exists "${SRC}" \
     || die "Source key not found in GCS: ${SRC}. List candidates with: docker compose exec backup bash -lc 'source /usr/local/bin/backup-scripts/_lib.sh && aws_gcs ls $(s3_uri postgres/)'"
 
 # --- pre-flight: detect live connections -------------------------------------
-# 'posthog'-as-name backends are dependent services. Catch the most common
-# operator mistake (forgetting to stop them) before we destroy data.
-#
-# `psql` failure here means we can't even connect -- if so, restore would
-# fail too. Die before doing anything destructive (no snapshot, no DROP).
-# Connect to `postgres` (the default database, always present), not `posthog`:
-# the latter may not exist yet (fresh cluster) or may have been dropped by a
-# prior failed restore attempt. pg_stat_activity is global -- the query still
-# returns connections to the `posthog` database from any session.
+# 'posthog'-as-name backends are dependent services. We refuse to proceed
+# if any are still connected -- "continue anyway" mode just guarantees a
+# half-restored DB and crash-looping consumers. Operator stops services,
+# re-runs the script.
 log "Checking for live PG connections..."
-if ! ACTIVE=$(PGPASSWORD="${POSTHOG_DB_PASSWORD}" \
-    psql -h "${PGHOST:-db}" -U "${PGUSER:-posthog}" -d postgres -tAc \
-        "SELECT count(*) FROM pg_stat_activity
-         WHERE datname='posthog' AND pid <> pg_backend_pid()
-           AND application_name NOT LIKE 'pg_%'"); then
-    die "Failed to connect to PG at ${PGHOST:-db} as ${PGUSER:-posthog} (db=postgres). Refusing to restore -- if we can't connect to query state, we can't restore either. Verify POSTHOG_DB_PASSWORD and that the db service is up."
-fi
-ACTIVE=${ACTIVE//[[:space:]]/}
-if [ "${ACTIVE:-0}" -gt 0 ]; then
-    warn "${ACTIVE} active backend(s) on posthog DB. Restoring with live consumers will produce TableNotExistsError storms."
-    warn "Stop dependents from the HOST FIRST, then re-run this script:"
-    print_stop_dependents_cmd
-    confirm_destructive "Continue ANYWAY (will crash-loop ${ACTIVE} consumers)?"
-fi
+assert_pg_dependents_stopped
 
 # --- pre-restore safety net --------------------------------------------------
 PRE_RESTORE="${SENTINEL_DIR}/pre-restore-pg-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"

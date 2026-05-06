@@ -38,5 +38,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # tables (rebuildable / disposable).
 30 4 * * 0  flock -n /tmp/ch-persons.lock /usr/local/bin/backup-scripts/backup-ch-persons.sh             2>&1
 
+# Cleanup local rollback artifacts (PG pre-restore .sql.gz snapshots > 7d).
+# CH freeze cleanup is operator-driven -- see restore-ch-events.sh output.
+# Runs daily at 05:30 UTC, after all backup jobs have settled.
+30 5 * * *  flock -n /tmp/cleanup.lock    /usr/local/bin/backup-scripts/cleanup-restore-rollbacks.sh     2>&1
+
 # crond REQUIRES a trailing newline -- empty line below is intentional.
 

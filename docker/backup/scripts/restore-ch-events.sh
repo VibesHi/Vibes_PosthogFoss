@@ -25,8 +25,13 @@
 # which creates a hardlinked snapshot inside the CH data directory at
 # /var/lib/clickhouse/shadow/. Cheap (no copy, just inodes) and gives you a
 # fully recoverable in-place rollback if the restore is wrong. Clean up
-# manually with `SYSTEM UNFREEZE WITH NAME '<backup_name>'` once you trust
-# the restore.
+# manually with `rm -rf /var/lib/clickhouse/shadow/<freeze-name>/` from
+# inside the clickhouse container once you trust the restore.
+#
+# Why not `SYSTEM UNFREEZE`? Recent CH builds may disable it in stock
+# configs (it can race with replication). Plain `rm -rf` against the
+# shadow path is always safe -- shadow/ is operator-managed, CH never
+# touches it autonomously.
 
 SCRIPT_NAME=restore-ch-events
 # shellcheck source=_lib.sh
@@ -117,7 +122,9 @@ status=$(ch_query "SELECT status FROM system.backups ORDER BY start_time DESC LI
 ROW_COUNT=$(ch_query "SELECT count() FROM posthog.sharded_events WHERE toYYYYMM(timestamp) = ${PARTITION}" | tr -d '[:space:]')
 log "Partition ${PARTITION} restored: ${ROW_COUNT} rows"
 
-log "Cleanup the rollback freeze when you trust the restore:"
-log "  ch_query \"SYSTEM UNFREEZE WITH NAME '${FREEZE_NAME}'\""
+log "Rollback freeze kept at /var/lib/clickhouse/shadow/${FREEZE_NAME}/ in the clickhouse container."
+log "Once you trust the restore, clean it up MANUALLY from the HOST:"
+log "  docker compose exec clickhouse rm -rf /var/lib/clickhouse/shadow/${FREEZE_NAME}/"
+log "(cleanup-restore-rollbacks.sh does NOT touch CH shadows -- backup container can't see CH's data volume.)"
 
 ok restore-ch-events

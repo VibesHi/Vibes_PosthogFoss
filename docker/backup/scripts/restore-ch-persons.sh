@@ -44,6 +44,16 @@ require_ch_creds
 
 ARG="${1:-latest}"
 
+# --- pre-flight: refuse on orphan parallel DBs holding dictionaries ----------
+# Orphan parallel DBs (e.g. `posthog_verify` left behind by a failed AS-clause
+# restore drill) can hold Dictionary-engine tables whose source clauses still
+# reference `posthog.<source_table>`. CH refuses DROP TABLE on the source
+# while any Dictionary anywhere depends on it (HAVE_DEPENDENT_OBJECTS, code
+# 630). Detect upfront and refuse to start so we don't get half-way through
+# a destructive drop loop and stall.
+log "Checking for orphan databases with Dictionary tables..."
+assert_no_cross_db_dict_deps_on_posthog
+
 # Mirror of the EXCEPT list in backup-ch-persons.sh. MUST stay in sync --
 # any table here is NOT touched by drop OR restore. If you change one, change
 # the other.
