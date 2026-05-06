@@ -98,13 +98,18 @@ ch_query() {
     require_ch_creds
     local query="$1"
     local body http
+    # CH HTTP convention: `?query=...` is a URL param (form-style), but the
+    # POST BODY is always treated as raw SQL regardless of Content-Type. So
+    # `--data-urlencode "query=..."` produces a POST body of `query=SELECT+1`
+    # which CH then parses as SQL -> syntax error on the literal `q`.
+    # Use --data-binary to send the SQL as-is.
     body=$(curl -sS \
         -o /dev/stdout \
         -w '\n__HTTP__:%{http_code}' \
         -H "X-ClickHouse-User: default" \
         -H "X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" \
         "http://${CLICKHOUSE_HOST:-clickhouse}:${CLICKHOUSE_PORT_HTTP:-8123}/" \
-        --data-urlencode "query=${query}") \
+        --data-binary "${query}") \
         || { printf 'CH curl failed (network/connection):\n%s\n' "$body" >&2; return 1; }
     http=${body##*__HTTP__:}
     body=${body%$'\n'__HTTP__:*}
