@@ -38,8 +38,23 @@
   in-progress query when the server cap is hit. Server stays alive either way.
 -->
 <clickhouse>
-    <max_server_memory_usage>8589934592</max_server_memory_usage>             <!-- 8 GB -->
-    <max_server_memory_usage_to_ram_ratio>0.3</max_server_memory_usage_to_ram_ratio>
+    <max_server_memory_usage>8589934592</max_server_memory_usage>             <!-- 8 GB absolute cap -->
+    <!--
+      Active cap = min(max_server_memory_usage, ratio × cgroup_RAM).
+      "available RAM" from CH's POV is the CONTAINER's cgroup limit
+      (x-mem-clickhouse in docker-compose.prod.yml), NOT the host RAM.
+      Currently 14 GB cgroup × 0.5 ratio = 7 GB CH cap. The 8 GB absolute
+      kicks in only if the cgroup grows to >16 GB.
+
+      Tuning rule: pick `mem-clickhouse` ≤ ~half of host RAM, then ratio
+      so that `cgroup × ratio` is ~70-80% of cgroup. The 0.3 default was
+      sized for an unrelated install and was way too tight after the
+      events-export workload landed (Code 241 OOM at 3 GB cap).
+
+      If you bump x-mem-clickhouse, optionally bump the absolute cap above
+      proportionally so this knob remains the operative one.
+    -->
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
     <max_thread_pool_size>1000</max_thread_pool_size>
     <max_concurrent_queries>50</max_concurrent_queries>
     <mark_cache_size>1073741824</mark_cache_size>                             <!-- 1 GB -->

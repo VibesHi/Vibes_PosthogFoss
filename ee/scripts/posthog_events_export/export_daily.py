@@ -220,6 +220,18 @@ def export_events_sql(database: str, team_id: int, day: dt.date, *, final: bool)
     # applies to `uuid` and `person_id` if anyone later filters on them.
     # Solution: never reuse a column name as an alias for a projected expression.
     # We use `_str` suffixes for the casted projections instead.
+    #
+    # NO `ORDER BY`: this query streams via JSONEachRow, and ORDER BY would
+    # force CH's MergeSortingTransform to buffer the entire day in memory
+    # (~100MB-1GB depending on team volume). On a memory-tight server that's
+    # the difference between a working export and `Code: 241 MEMORY_LIMIT_EXCEEDED`.
+    # Order is not load-bearing for the importer:
+    #   * batch-import-worker reads `properties.time` per-event (in-file order
+    #     does NOT determine event timestamp ordering downstream)
+    #   * ReplacingMergeTree dedup is by sort key, not file order
+    # The trade-off is byte-for-byte non-determinism between re-runs of the
+    # same (team, day). Idempotency is preserved at the (team, day, GCS-object)
+    # level via the already-done check in process_team_day.
     return f"""
 SELECT
     toString(uuid)                                                              AS uuid_str,
@@ -233,7 +245,6 @@ FROM {database}.sharded_events {final_clause}
 WHERE team_id = {team_id}
   AND timestamp >= toDateTime('{day:%Y-%m-%d} 00:00:00', 'UTC')
   AND timestamp <  toDateTime('{day:%Y-%m-%d} 00:00:00', 'UTC') + INTERVAL 1 DAY
-ORDER BY timestamp
 FORMAT JSONEachRow
 """.strip()
 

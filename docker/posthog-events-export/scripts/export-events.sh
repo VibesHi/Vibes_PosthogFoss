@@ -34,6 +34,17 @@ export AWS_SECRET_ACCESS_KEY="${EVENTS_EXPORT_GCS_HMAC_SECRET}"
 export AWS_DEFAULT_REGION="${EVENTS_EXPORT_GCS_REGION:-auto}"
 export AWS_ENDPOINT_URL="https://storage.googleapis.com"
 
+# botocore >= 1.36 added auto-attached request checksums (CRC32 by default)
+# to PUT/multipart calls. The new headers (`x-amz-sdk-checksum-algorithm`,
+# `x-amz-checksum-crc32`, ...) are NOT included in GCS's S3-interop
+# canonical-request signature computation, so the signatures diverge and
+# every PUT fails with `SignatureDoesNotMatch ... Invalid argument`. The
+# fix is to tell botocore to skip checksums unless explicitly required.
+# Ref: https://github.com/boto/boto3/issues/4435 (multiple non-AWS S3
+# providers — Cloudflare R2, Backblaze B2, GCS — all hit the same wall).
+export AWS_REQUEST_CHECKSUM_CALCULATION="when_required"
+export AWS_RESPONSE_CHECKSUM_VALIDATION="when_required"
+
 # CH connection (passed to python via env, NOT CLI flags, so secrets
 # don't show up in `docker compose top` output).
 export CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-clickhouse}"

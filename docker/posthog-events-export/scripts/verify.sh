@@ -38,6 +38,11 @@ export AWS_ACCESS_KEY_ID="${EVENTS_EXPORT_GCS_HMAC_KEY}"
 export AWS_SECRET_ACCESS_KEY="${EVENTS_EXPORT_GCS_HMAC_SECRET}"
 export AWS_DEFAULT_REGION="${EVENTS_EXPORT_GCS_REGION:-auto}"
 export AWS_ENDPOINT_URL="https://storage.googleapis.com"
+# See export-events.sh: botocore 1.36+ checksum auto-attach breaks GCS
+# interop signature validation. Mirror the workaround here so verify
+# runs against the same client config.
+export AWS_REQUEST_CHECKSUM_CALCULATION="when_required"
+export AWS_RESPONSE_CHECKSUM_VALIDATION="when_required"
 
 TEAM_FILTER="${1:-all}"
 BUCKET="$(gcs_bucket_name)"

@@ -59,7 +59,7 @@ x-restart-prod: &restart-prod
 #   Kafka seastar --memory (default 5G)       → see `services.kafka.command`
 #   web prefork processes (default 2)         → NGINX_UNIT_APP_PROCESSES in .env
 #   worker Celery prefork (default 2)         → WEB_CONCURRENCY in .env
-x-mem-clickhouse: &mem-clickhouse  { mem_limit: 10g,    memswap_limit: 10g }
+x-mem-clickhouse: &mem-clickhouse  { mem_limit: 14g,    memswap_limit: 14g }
 # Postgres needs real headroom: shared_buffers (1g) + work_mem × max_connections
 # (16m × 200 = 3.2g worst case during sorts/hashes) + maintenance_work_mem ×
 # autovacuum_workers (256m × 3 = 768m) + WAL/per-backend overhead (~500m) =

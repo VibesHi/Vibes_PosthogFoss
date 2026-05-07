@@ -29,9 +29,22 @@
 <clickhouse>
     <profiles>
         <default>
-            <!-- 3 GB per single query; server cap is 8 GB so 2-3 concurrent fit. -->
-            <max_memory_usage>3221225472</max_memory_usage>
-            <!-- Same cap for distributed/joined query stages on this server. -->
+            <!--
+              4 GB per single query. With server cap at 7 GB (14 GB cgroup
+              × 0.5 ratio, see config.d.prod/memory_limits.xml), one heavy
+              query has comfortable headroom AND a second small query can
+              still fit alongside it before OvercommitTracker kicks the
+              larger one out.
+
+              The events-export streaming SELECT comfortably fits in <500 MB
+              without ORDER BY, but dashboard queries with GROUP BY + JOIN
+              over a month of events will use 2-3 GB. 4 GB gives margin.
+
+              Bumped from 3 GB.
+            -->
+            <max_memory_usage>4294967296</max_memory_usage>
+            <!-- Per-user cap: 1.5× per-query so a single dashboard with two
+                 charts in flight doesn't trip the cap. -->
             <max_memory_usage_for_user>6442450944</max_memory_usage_for_user>
         </default>
     </profiles>
