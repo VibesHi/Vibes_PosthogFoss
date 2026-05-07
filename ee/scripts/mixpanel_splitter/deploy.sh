@@ -4,7 +4,7 @@
 #
 # Required env (export before running):
 #   GCP_PROJECT          e.g. hoolimoon
-#   GCS_BUCKET           e.g. posthog-helper-bucket
+#   GCS_BUCKET           e.g. vibes-analytics-events
 #   SPLITTER_SA_EMAIL    e.g. posthog-migration@hoolimoon.iam.gserviceaccount.com
 #                        (must have storage.objectAdmin on $GCS_BUCKET — needed
 #                         because it both READS the monthly inputs and WRITES
@@ -15,7 +15,7 @@
 #   IMAGE_REPO           default gcr.io/$GCP_PROJECT/mixpanel-splitter
 #   JOB_NAME             default mixpanel-splitter
 #   SRC_PREFIX           default "" (bucket root)
-#   DST_PREFIX           default mixpanel-daily/
+#   DST_PREFIX           default mixpanel-events/moonx/
 #   CONCURRENCY          default 4
 #   TASK_TIMEOUT         default 86400s (24h, the Cloud Run Job max)
 #   CPU                  default 4
@@ -36,7 +36,7 @@ AR_REPO="${AR_REPO:-cloud-run-source-deploy}"
 IMAGE_REPO="${IMAGE_REPO:-$REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/mixpanel-splitter}"
 JOB_NAME="${JOB_NAME:-mixpanel-splitter}"
 SRC_PREFIX="${SRC_PREFIX:-}"
-DST_PREFIX="${DST_PREFIX:-mixpanel-daily/}"
+DST_PREFIX="${DST_PREFIX:-mixpanel-events/moonx/}"
 CONCURRENCY="${CONCURRENCY:-4}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-86400s}"
 CPU="${CPU:-4}"

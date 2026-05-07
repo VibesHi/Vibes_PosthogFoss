@@ -128,7 +128,7 @@ func main() {
 	var cfg config
 	flag.StringVar(&cfg.bucket, "bucket", "", "GCS bucket (required)")
 	flag.StringVar(&cfg.srcPrefix, "src-prefix", "", "Source object prefix (e.g. \"\" for bucket root)")
-	flag.StringVar(&cfg.dstPrefix, "dst-prefix", "mixpanel-daily/", "Destination object prefix for daily files")
+	flag.StringVar(&cfg.dstPrefix, "dst-prefix", "mixpanel-events/moonx/", "Destination object prefix for daily files")
 	flag.StringVar(&cfg.inputPattern, "input-pattern", "events_", "Substring an input object name must contain to be processed")
 	flag.IntVar(&cfg.concurrency, "concurrency", 4, "Number of input objects processed in parallel")
 	flag.IntVar(&cfg.maxLineBytes, "max-line-bytes", 4*1024*1024, "Maximum size of a single JSONL line (default 4 MiB)")

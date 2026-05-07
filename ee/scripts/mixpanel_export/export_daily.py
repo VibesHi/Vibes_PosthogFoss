@@ -18,11 +18,11 @@ Output layout (year/month/day) under whatever URL you point at:
 
 `<output>` is anything `fsspec` understands, e.g.:
 
-    gs://posthog-helper-bucket/mixpanel-daily/
-    s3://my-bucket/mixpanel-daily/
-    file:///data/mixpanel-daily/
-    /data/mixpanel-daily/                  # local FS, sugar
-    ./mixpanel-daily/                      # local FS, sugar
+    gs://vibes-analytics-events/mixpanel-events/moonx/
+    s3://my-bucket/mixpanel-events/
+    file:///data/mixpanel-events/
+    /data/mixpanel-events/                 # local FS, sugar
+    ./mixpanel-events/                     # local FS, sugar
 
 Idempotent by default: if the destination object already exists it is
 skipped. Use --overwrite to force re-export.
@@ -33,7 +33,8 @@ Auth:
 - Output: each fsspec backend has its own auth (env vars, ADC, ~/.aws, …).
   See README.md for the cheatsheet.
 
-Default output is `gs://posthog-helper-bucket/` so most invocations are short:
+Default output is `gs://vibes-analytics-events/mixpanel-events/moonx/` so most
+invocations are short:
 
     # Daily cron — exports yesterday (UTC) into the default bucket
     python export_daily.py --yesterday
@@ -334,14 +335,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--output",
         default=os.environ.get(
             "MIXPANEL_EXPORT_OUTPUT",
-            "gs://posthog-helper-bucket/",
+            "gs://vibes-analytics-events/mixpanel-events/moonx/",
         ),
         help=(
             "Destination root URL (fsspec). Examples: "
             "gs://bucket/, s3://bucket/, /data/, ./out/. "
             "Final layout is <output>YYYY/MM/YYYY-MM-DD.jsonl.gz. "
             "Override via $MIXPANEL_EXPORT_OUTPUT or this flag. "
-            "Default: gs://posthog-helper-bucket/"
+            "Default: gs://vibes-analytics-events/mixpanel-events/moonx/"
         ),
     )
     p.add_argument("--project-id", default=os.environ.get("MIXPANEL_PROJECT_ID"))

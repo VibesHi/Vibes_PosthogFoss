@@ -32,8 +32,8 @@ Run from your laptop. ~10 min total.
 ### 0.1 Sample the format on existing monthlies
 
 ```bash
-gsutil cat gs://posthog-helper-bucket/events_2024-03-01_2024-03-31.jsonl \
-    | head -1 | jq .
+gsutil cat gs://vibes-analytics-events/mixpanel-events/moonx/2024/03/2024-03-15.jsonl.gz \
+    | gunzip | head -1 | jq .
 ```
 Want: `{event, properties:{time, distinct_id, $insert_id, ...}}`. Already
 verified for this dataset on 2026-05-05.
@@ -73,33 +73,41 @@ Pick the target team_id. The worker's `ENCRYPTION_KEYS` env (forwarded from
 `ENCRYPTION_SALT_KEYS` in the compose patch) MUST match the value Django
 uses, otherwise it can't decrypt `BatchImport.secrets`.
 
-## Phase 1 — Reshard monthly → daily on GCS
+## Phase 1 — Export Mixpanel daily files to GCS
 
-See `../mixpanel_splitter/README.md` for full details.
+Use `../mixpanel_export/export_daily.py` (the splitter is legacy — see its
+README for why). Layout: `<output>/YYYY/MM/YYYY-MM-DD.jsonl.gz`.
 
 ```bash
-cd ee/scripts/mixpanel_splitter
-export GCP_PROJECT=hoolimoon
-export GCS_BUCKET=posthog-helper-bucket
-export SPLITTER_SA_EMAIL=posthog-migration@hoolimoon.iam.gserviceaccount.com
-./deploy.sh
+cd ee/scripts/mixpanel_export
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+export MIXPANEL_USERNAME='posthog-migration.xxxxxx.mp-service-account'
+export MIXPANEL_PASSWORD='...'
+export MIXPANEL_PROJECT_ID='3193232'
+
+# Backfill the whole archive (default output is gs://vibes-analytics-events/mixpanel-events/moonx/)
+python export_daily.py --range 2024-02-01 2026-05-01 --concurrency 2
 ```
 
-Wall time: ~1–2 h for ~1.5 TB at concurrency 4 in europe-west4.
+Wall time: depends on Mixpanel rate-limits, typically several hours per year
+of data. The script honors `Retry-After` and is fully resumable on rerun
+(skips destinations that already exist).
 
-When done, verify:
+When done, verify coverage:
 ```bash
-gsutil ls -l gs://posthog-helper-bucket/mixpanel-daily/ | head
-gsutil ls gs://posthog-helper-bucket/mixpanel-daily/ | wc -l   # ~810 files
+gsutil ls 'gs://vibes-analytics-events/mixpanel-events/moonx/**/*.jsonl.gz' | wc -l
 ```
 
 Spot-check a daily file:
 ```bash
-gsutil cat gs://posthog-helper-bucket/mixpanel-daily/2024-03-15.jsonl.gz \
+gsutil cat gs://vibes-analytics-events/mixpanel-events/moonx/2024/03/2024-03-15.jsonl.gz \
     | gunzip | head -1 | jq .
 ```
-Should look identical to the monthly sample (worker's parser will normalize
-during import).
+Want: `{event, properties:{time, distinct_id, $insert_id, ...}}`. The
+batch-import-worker's parser normalizes geo and translates names during
+import.
 
 ## Phase 2 — Build & start batch-import-worker
 
@@ -206,35 +214,30 @@ applies to the whole run. You'll re-enable in Phase 5.
 
 ### 3.1 Create the BatchImport row
 
-Set creds on the prod host shell (NOT in any committed file):
+The script reuses `EVENTS_EXPORT_GCS_BUCKET` / `EVENTS_EXPORT_GCS_HMAC_KEY` /
+`EVENTS_EXPORT_GCS_HMAC_SECRET` from `.env` (same SA, same bucket as the
+posthog-events-export container). The compose `web` service already exposes
+those env vars to the container, so no extra `-e` plumbing needed.
+
 ```bash
-export GCS_HMAC_ACCESS_KEY_ID='GOOG1...'
-export GCS_HMAC_SECRET_ACCESS_KEY='...'
 export POSTHOG_TEAM_ID=1                       # from Phase 0.3
-export GCS_BUCKET=posthog-helper-bucket
 # Pilot: smallest day in the dataset. Pick one that fits in ~30 min:
-export GCS_PREFIX='mixpanel-daily/2024-03-01.jsonl.gz'
+export MIXPANEL_IMPORT_GCS_PREFIX='mixpanel-events/moonx/2024/03/2024-03-01.jsonl.gz'
 ```
 
 Dry-run first (prints config, creates nothing):
 ```bash
 docker compose -f docker-compose.prod.yml exec -T \
-    -e GCS_HMAC_ACCESS_KEY_ID="$GCS_HMAC_ACCESS_KEY_ID" \
-    -e GCS_HMAC_SECRET_ACCESS_KEY="$GCS_HMAC_SECRET_ACCESS_KEY" \
     -e POSTHOG_TEAM_ID="$POSTHOG_TEAM_ID" \
-    -e GCS_BUCKET="$GCS_BUCKET" \
-    -e GCS_PREFIX="$GCS_PREFIX" \
+    -e MIXPANEL_IMPORT_GCS_PREFIX="$MIXPANEL_IMPORT_GCS_PREFIX" \
     web python -m ee.scripts.mixpanel_import.create_import --dry-run
 ```
 
 Then real:
 ```bash
 docker compose -f docker-compose.prod.yml exec -T \
-    -e GCS_HMAC_ACCESS_KEY_ID="$GCS_HMAC_ACCESS_KEY_ID" \
-    -e GCS_HMAC_SECRET_ACCESS_KEY="$GCS_HMAC_SECRET_ACCESS_KEY" \
     -e POSTHOG_TEAM_ID="$POSTHOG_TEAM_ID" \
-    -e GCS_BUCKET="$GCS_BUCKET" \
-    -e GCS_PREFIX="$GCS_PREFIX" \
+    -e MIXPANEL_IMPORT_GCS_PREFIX="$MIXPANEL_IMPORT_GCS_PREFIX" \
     web python -m ee.scripts.mixpanel_import.create_import
 ```
 Output ends with the `BatchImport.id` UUID — note it.
@@ -247,8 +250,8 @@ docker compose -f docker-compose.prod.yml logs -f batch-import-worker
 Expect within ~10s:
 ```
 INFO leasing job <uuid>
-INFO listing keys in bucket posthog-helper-bucket prefix mixpanel-daily/2024-03-01.jsonl.gz
-INFO downloading key mixpanel-daily/2024-03-01.jsonl.gz
+INFO listing keys in bucket vibes-analytics-events prefix mixpanel-events/moonx/2024/03/2024-03-01.jsonl.gz
+INFO downloading key mixpanel-events/moonx/2024/03/2024-03-01.jsonl.gz
 INFO produced N events to events_plugin_ingestion_historical
 INFO job <uuid> completed
 ```
@@ -274,29 +277,28 @@ running the full import.
 
 Same script, point at the whole prefix:
 ```bash
-export GCS_PREFIX='mixpanel-daily/'
-
 docker compose -f docker-compose.prod.yml exec -T \
-    -e GCS_HMAC_ACCESS_KEY_ID="$GCS_HMAC_ACCESS_KEY_ID" \
-    -e GCS_HMAC_SECRET_ACCESS_KEY="$GCS_HMAC_SECRET_ACCESS_KEY" \
     -e POSTHOG_TEAM_ID="$POSTHOG_TEAM_ID" \
-    -e GCS_BUCKET="$GCS_BUCKET" \
-    -e GCS_PREFIX="$GCS_PREFIX" \
+    -e MIXPANEL_IMPORT_GCS_PREFIX='mixpanel-events/moonx/' \
     web python -m ee.scripts.mixpanel_import.create_import
 ```
 
-Worker now sees ~810 keys under that prefix. It processes them sequentially
-within one job (s3_gzip extracts one key at a time). To get cross-key
-parallelism, scale worker replicas — but with one job, it's a single
-worker. For real parallelism, create multiple BatchImport rows partitioned
-by sub-prefix:
+Worker walks the prefix recursively and processes every `.jsonl.gz` it
+finds, regardless of YYYY/MM directory shape. Within one job s3_gzip
+extracts keys sequentially. For cross-key parallelism, create multiple
+BatchImport rows partitioned by month sub-prefix:
 
 ```bash
-# Quarterly partitioning example (4 jobs run in parallel across 4 worker replicas)
-for q in 2024-Q1 2024-Q2 2024-Q3 2024-Q4 2025-Q1 2025-Q2 2025-Q3 2025-Q4 2026-Q1 2026-Q2; do
-    GCS_PREFIX="mixpanel-daily/$q-" docker compose -f docker-compose.prod.yml exec -T \
-        -e GCS_HMAC_ACCESS_KEY_ID -e GCS_HMAC_SECRET_ACCESS_KEY \
-        -e POSTHOG_TEAM_ID -e GCS_BUCKET -e GCS_PREFIX \
+# Per-month partitioning (each month becomes its own job, runs in parallel
+# across worker replicas)
+for ym in 2024/02 2024/03 2024/04 2024/05 2024/06 2024/07 2024/08 2024/09 \
+          2024/10 2024/11 2024/12 \
+          2025/01 2025/02 2025/03 2025/04 2025/05 2025/06 2025/07 2025/08 \
+          2025/09 2025/10 2025/11 2025/12 \
+          2026/01 2026/02 2026/03 2026/04 2026/05; do
+    docker compose -f docker-compose.prod.yml exec -T \
+        -e POSTHOG_TEAM_ID \
+        -e MIXPANEL_IMPORT_GCS_PREFIX="mixpanel-events/moonx/$ym/" \
         web python -m ee.scripts.mixpanel_import.create_import
 done
 ```
@@ -305,10 +307,6 @@ Then bump worker replica count:
 docker compose -f docker-compose.prod.yml --profile migration \
     up -d --scale batch-import-worker=4 batch-import-worker
 ```
-
-(Note: file naming is YYYY-MM-DD, not YYYY-QN — adapt the prefix to match
-your actual layout, e.g. `mixpanel-daily/2024-03` for "March 2024 only".
-Lexicographic prefix matching is good enough.)
 
 ### 4.1 Monitoring during full run
 
@@ -389,11 +387,8 @@ docker compose -f docker-compose.prod.yml --profile migration down batch-import-
 gcloud run jobs delete mixpanel-splitter \
     --region=europe-west4 --project=hoolimoon
 
-# Optional: drop the original monthly inputs to save GCS storage
-gsutil -m rm 'gs://posthog-helper-bucket/events_*.jsonl'
-
 # Keep the daily files until you're confident the import is good. Delete later:
-# gsutil -m rm -r gs://posthog-helper-bucket/mixpanel-daily/
+# gsutil -m rm -r gs://vibes-analytics-events/mixpanel-events/moonx/
 ```
 
 ## Phase 6 — (Optional) Backfill Person profiles for personless events

@@ -35,17 +35,26 @@ from typing import Any
 # All operator-facing output goes through print() instead.
 
 
+# GCS env-var convention:
+# We share the analytics bucket with `posthog-events-export` (different subdir
+# per use case). Same SA, same HMAC pair → reuse `EVENTS_EXPORT_GCS_*` directly
+# instead of duplicating creds in a Mixpanel-specific namespace.
+#
+# Do NOT use `GCS_BUCKET` / `GCS_HMAC_*` — those belong to the backup container
+# and point at a different bucket. Collision footgun.
 REQUIRED_ENV = (
     "POSTHOG_TEAM_ID",
-    "GCS_BUCKET",
-    "GCS_HMAC_ACCESS_KEY_ID",
-    "GCS_HMAC_SECRET_ACCESS_KEY",
+    "EVENTS_EXPORT_GCS_BUCKET",
+    "EVENTS_EXPORT_GCS_HMAC_KEY",
+    "EVENTS_EXPORT_GCS_HMAC_SECRET",
 )
 
 DEFAULTS = {
-    "GCS_PREFIX": "mixpanel-daily/",
-    "GCS_REGION": "auto",
-    "GCS_ENDPOINT_URL": "https://storage.googleapis.com",
+    # Only the prefix is Mixpanel-specific. Bucket and creds come from EVENTS_EXPORT_*.
+    # Per-month invocations narrow with `--prefix mixpanel-events/moonx/2024/01/`.
+    "MIXPANEL_IMPORT_GCS_PREFIX": "mixpanel-events/moonx/",
+    "MIXPANEL_IMPORT_GCS_REGION": "auto",
+    "MIXPANEL_IMPORT_GCS_ENDPOINT_URL": "https://storage.googleapis.com",
     # The Rust worker treats `sink.topic` as a logical alias, not the actual
     # Kafka topic name. Valid values: "main", "historical", "overflow". They
     # resolve via KAFKA_TOPIC_MAIN / KAFKA_TOPIC_HISTORICAL / KAFKA_TOPIC_OVERFLOW
@@ -84,6 +93,12 @@ def _env(name: str, default: str | None = None) -> str:
         print(f"ERROR: missing required env var: {name}", file=sys.stderr)
         sys.exit(2)
     return value
+
+
+def _bucket_name() -> str:
+    """`EVENTS_EXPORT_GCS_BUCKET` is stored with a `gs://` prefix in .env.
+    The Rust worker's S3-interop client wants the bare name."""
+    return os.environ["EVENTS_EXPORT_GCS_BUCKET"].removeprefix("gs://").rstrip("/")
 
 
 def build_import_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -144,22 +159,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--prefix",
-        default=_env("GCS_PREFIX", DEFAULTS["GCS_PREFIX"]),
-        help="GCS object prefix (e.g. 'mixpanel-daily/')",
+        default=_env("MIXPANEL_IMPORT_GCS_PREFIX", DEFAULTS["MIXPANEL_IMPORT_GCS_PREFIX"]),
+        help="GCS object prefix (e.g. 'mixpanel-events/moonx/2024/01/')",
     )
     parser.add_argument(
         "--bucket",
-        default=_env("GCS_BUCKET"),
-        help="GCS bucket name",
+        default=_bucket_name(),
+        help="GCS bucket name (default: stripped from $EVENTS_EXPORT_GCS_BUCKET)",
     )
     parser.add_argument(
         "--region",
-        default=_env("GCS_REGION", DEFAULTS["GCS_REGION"]),
+        default=_env("MIXPANEL_IMPORT_GCS_REGION", DEFAULTS["MIXPANEL_IMPORT_GCS_REGION"]),
         help="AWS-SDK region label (any string, GCS ignores it; 'auto' is fine)",
     )
     parser.add_argument(
         "--endpoint-url",
-        default=_env("GCS_ENDPOINT_URL", DEFAULTS["GCS_ENDPOINT_URL"]),
+        default=_env("MIXPANEL_IMPORT_GCS_ENDPOINT_URL", DEFAULTS["MIXPANEL_IMPORT_GCS_ENDPOINT_URL"]),
         help="GCS S3 interop endpoint",
     )
     parser.add_argument(
@@ -218,8 +233,8 @@ def main() -> None:
 
     import_config = build_import_config(args)
     secrets = build_secrets(
-        access_key_id=os.environ["GCS_HMAC_ACCESS_KEY_ID"],
-        secret_access_key=os.environ["GCS_HMAC_SECRET_ACCESS_KEY"],
+        access_key_id=os.environ["EVENTS_EXPORT_GCS_HMAC_KEY"],
+        secret_access_key=os.environ["EVENTS_EXPORT_GCS_HMAC_SECRET"],
     )
 
     if args.dry_run:

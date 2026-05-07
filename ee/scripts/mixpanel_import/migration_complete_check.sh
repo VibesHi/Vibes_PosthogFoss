@@ -34,8 +34,8 @@
 #   CH_DATABASE         posthog
 #   CH_TABLE            events            (distributed view; raw is sharded_events)
 #   CLICKHOUSE_PASSWORD read from .env if unset
-#   GCS_BUCKET          posthog-helper-bucket
-#   GCS_PREFIX          mixpanel-daily
+#   GCS_BUCKET          vibes-analytics-events
+#   GCS_PREFIX          mixpanel-events/moonx
 #   TOLERANCE_PCT       1                 (per-day count diff tolerance)
 #   LAG_OK_THRESHOLD    100               (warn instead of fail if 0 < lag <= this)
 #   PARALLEL            8                 (gsutil concurrent file counts)
@@ -67,8 +67,8 @@ KAFKA_SERVICE="${KAFKA_SERVICE:-kafka}"
 CH_SERVICE="${CH_SERVICE:-clickhouse}"
 CH_DATABASE="${CH_DATABASE:-posthog}"
 CH_TABLE="${CH_TABLE:-events}"
-GCS_BUCKET="${GCS_BUCKET:-posthog-helper-bucket}"
-GCS_PREFIX="${GCS_PREFIX:-mixpanel-daily}"
+GCS_BUCKET="${GCS_BUCKET:-vibes-analytics-events}"
+GCS_PREFIX="${GCS_PREFIX:-mixpanel-events/moonx}"
 TOLERANCE_PCT="${TOLERANCE_PCT:-1}"
 LAG_OK_THRESHOLD="${LAG_OK_THRESHOLD:-100}"
 PARALLEL="${PARALLEL:-8}"
@@ -244,19 +244,22 @@ else
         done <<<"$ch_out"
 
         # ---- Source counts (parallel gsutil) ----
-        # Try two layout conventions before giving up:
-        #   (a) ${GCS_PREFIX}/${month}-*.jsonl.gz  e.g. mixpanel-daily/2024-03-*.jsonl.gz
-        #   (b) ${month//-//}/${month}-*.jsonl.gz  e.g. 2024/03/2024-03-*.jsonl.gz
-        # (b) is the worker-friendly hierarchy used by the splitter for new months.
+        # Try multiple layout conventions before giving up:
+        #   (a) ${GCS_PREFIX}/${YYYY}/${MM}/${month}-*.jsonl.gz
+        #       e.g. mixpanel-events/moonx/2024/03/2024-03-*.jsonl.gz  (current)
+        #   (b) ${GCS_PREFIX}/${month}-*.jsonl.gz
+        #       e.g. mixpanel-daily/2024-03-*.jsonl.gz                 (legacy flat)
+        #   (c) ${YYYY}/${MM}/${month}-*.jsonl.gz at bucket root
+        #       e.g. 2024/03/2024-03-*.jsonl.gz                        (pre-move hierarchy)
         month_path="${month//-//}"  # 2024-03 -> 2024/03
-        glob_a="gs://${GCS_BUCKET}/${GCS_PREFIX}/${month}-*.jsonl.gz"
-        glob_b="gs://${GCS_BUCKET}/${month_path}/${month}-*.jsonl.gz"
+        glob_a="gs://${GCS_BUCKET}/${GCS_PREFIX}/${month_path}/${month}-*.jsonl.gz"
+        glob_b="gs://${GCS_BUCKET}/${GCS_PREFIX}/${month}-*.jsonl.gz"
+        glob_c="gs://${GCS_BUCKET}/${month_path}/${month}-*.jsonl.gz"
         files=$(gsutil ls "$glob_a" 2>/dev/null || true)
+        [[ -z "$files" ]] && files=$(gsutil ls "$glob_b" 2>/dev/null || true)
+        [[ -z "$files" ]] && files=$(gsutil ls "$glob_c" 2>/dev/null || true)
         if [[ -z "$files" ]]; then
-            files=$(gsutil ls "$glob_b" 2>/dev/null || true)
-        fi
-        if [[ -z "$files" ]]; then
-            fail "no GCS files matched either layout: '$glob_a' or '$glob_b'. Set GCS_PREFIX explicitly if your layout differs."
+            fail "no GCS files matched any of: '$glob_a', '$glob_b', '$glob_c'. Set GCS_PREFIX explicitly if your layout differs."
             mark_fail
             continue
         fi

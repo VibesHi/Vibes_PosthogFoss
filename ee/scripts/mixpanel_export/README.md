@@ -11,16 +11,16 @@ gzipped JSONL object per day to **any storage** supported by `fsspec`
 `<output>` is any URL `fsspec` understands:
 
 ```
-gs://posthog-helper-bucket/        ← default for this repo
+gs://vibes-analytics-events/mixpanel-events/moonx/   ← default for this repo
 s3://my-bucket/
 file:///data/
-/data/                             ← local FS shorthand
-./out/                             ← local FS shorthand
+/data/                                                ← local FS shorthand
+./out/                                                ← local FS shorthand
 ```
 
-Default output is `gs://posthog-helper-bucket/` (bucket root, year/month
-subfolders are created automatically). Override with `--output` or
-`MIXPANEL_EXPORT_OUTPUT` env var.
+Default output is `gs://vibes-analytics-events/mixpanel-events/moonx/`
+(year/month subfolders are created automatically beneath it). Override with
+`--output` or `MIXPANEL_EXPORT_OUTPUT` env var.
 
 ## Why this exists (vs `mixpanel_splitter`)
 
@@ -37,7 +37,7 @@ example we measured on `2024-03-28`:
 | File                                     | Total rows | Unique `$insert_id` | Duplicate rows |
 |------------------------------------------|-----------:|--------------------:|---------------:|
 | Fresh direct export (this script)        |    492,205 |             484,800 |          7,405 |
-| Old `mixpanel-daily/2024-03-28.jsonl.gz` |  1,695,177 |             484,800 |      1,210,377 |
+| Old splitter output for `2024-03-28`    |  1,695,177 |             484,800 |      1,210,377 |
 
 Same unique events, but old pipeline shipped 3.5× the rows. The PostHog
 batch-import-worker dedupes logically by `$insert_id` (UUIDv5), so analytics
@@ -174,11 +174,12 @@ Lexicographic sort = chronological order.
 with a GCS prefix. To import everything from this layout:
 
 ```bash
-export GCS_PREFIX=''           # whole archive (bucket root)
-# or partition by year:
-export GCS_PREFIX='2024/'
-# or month:
-export GCS_PREFIX='2024/03/'
+# Whole archive (the export root):
+export GCS_PREFIX='mixpanel-events/moonx/'
+# Or partition by year:
+export GCS_PREFIX='mixpanel-events/moonx/2024/'
+# Or by month:
+export GCS_PREFIX='mixpanel-events/moonx/2024/03/'
 ```
 
 The Rust batch-import-worker walks the prefix recursively and processes every

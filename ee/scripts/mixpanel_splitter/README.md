@@ -1,8 +1,12 @@
 # Mixpanel monthly → daily splitter
 
+> **Legacy.** Use `ee/scripts/mixpanel_export/export_daily.py` instead. The
+> splitter amplified duplicates badly on retries (1.7M physical rows for
+> 485k unique events in one observed day). Kept in repo for reference only.
+
 One-shot Go tool that reshards Mixpanel raw export `.jsonl` files in GCS from
 monthly (`events_2024-03-01_2024-03-31.jsonl`) to daily gzipped
-(`mixpanel-daily/2024-03-15.jsonl.gz`).
+(`mixpanel-events/moonx/2024-03-15.jsonl.gz`).
 
 ## Why split
 
@@ -36,7 +40,7 @@ Prereqs:
 
 ```bash
 export GCP_PROJECT=hoolimoon
-export GCS_BUCKET=posthog-helper-bucket
+export GCS_BUCKET=vibes-analytics-events
 export SPLITTER_SA_EMAIL=posthog-migration@hoolimoon.iam.gserviceaccount.com
 ./deploy.sh
 ```
@@ -54,9 +58,9 @@ gcloud beta run jobs logs tail mixpanel-splitter \
 ```bash
 gcloud auth application-default login
 go run . \
-    --bucket=posthog-helper-bucket \
+    --bucket=vibes-analytics-events \
     --src-prefix= \
-    --dst-prefix=mixpanel-daily/ \
+    --dst-prefix=mixpanel-events/moonx/ \
     --concurrency=2 \
     --dry-run     # remove --dry-run to actually write
 ```
@@ -71,7 +75,7 @@ committing GCS objects.
 |---|---|---|
 | `--bucket` | (required) | GCS bucket name |
 | `--src-prefix` | `""` | Object prefix for inputs (empty = bucket root) |
-| `--dst-prefix` | `mixpanel-daily/` | Output prefix for daily files |
+| `--dst-prefix` | `mixpanel-events/moonx/` | Output prefix for daily files |
 | `--input-pattern` | `events_` | Substring filter (skip outputs, only process inputs) |
 | `--concurrency` | `4` | Number of input objects processed in parallel |
 | `--max-line-bytes` | `4 MiB` | Max single JSONL line size; bump if you see "token too long" |
@@ -86,7 +90,7 @@ gs://<bucket>/<dst-prefix>YYYY-MM-DD.jsonl.gz
 
 Concrete example with defaults:
 ```
-gs://posthog-helper-bucket/mixpanel-daily/2024-03-15.jsonl.gz
+gs://vibes-analytics-events/mixpanel-events/moonx/2024-03-15.jsonl.gz
 ```
 
 ## Boundary leak
@@ -118,5 +122,5 @@ gcloud run jobs delete mixpanel-splitter \
 gcloud container images delete gcr.io/$GCP_PROJECT/mixpanel-splitter \
     --force-delete-tags --quiet
 # Optional: delete original monthly inputs to save GCS storage
-# gsutil -m rm gs://posthog-helper-bucket/events_*.jsonl
+# gsutil -m rm gs://vibes-analytics-events/events_*.jsonl
 ```
