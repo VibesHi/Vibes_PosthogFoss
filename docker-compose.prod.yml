@@ -327,20 +327,12 @@ services:
             - --reserve-memory 500M
             - --default-log-level=warn
             - --seeds kafka:33145
-            # Retention: 6 h. Kafka here is a buffer between Rust capture and
-            # the consumers (plugin-server, ClickHouse Kafka engine). Healthy
-            # consumers drain messages within seconds; retention only matters
-            # as a recovery window if a consumer dies. 6 h covers overnight
-            # outages on a single-host box with auto-restart.
-            #
-            # NOTE: Redpanda does NOT read KAFKA_LOG_RETENTION_* env vars
-            # (those are Bitnami Kafka conventions). Must use --set flags or
-            # `rpk cluster config set`. Default without these would be 7 days.
-            - --set redpanda.log_retention_ms=${KAFKA_LOG_RETENTION_MS:-21600000}
-            - --set redpanda.log_segment_size_jitter_percent=5
-            - --set redpanda.retention_bytes=1073741824
         depends_on:
             - zookeeper
+        # Cluster retention/segment/bytes properties are applied by the
+        # `kafka-init` service after broker startup via `rpk cluster config
+        # set` against the Admin API. Live changes also go through
+        # `rpk cluster config set` on a running broker.
         volumes:
             - kafka-data:/bitnami/kafka
 
@@ -1009,6 +1001,11 @@ services:
             # the kafka-init default while the broker advertises something else.
             KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-21600000}
             KAFKA_LOG_SEGMENT_SIZE: ${KAFKA_LOG_SEGMENT_SIZE:-134217728}
+            # Per-partition disk size cap. Hard ceiling for runaway-producer
+            # protection. Default 20 GiB is safely above 6h time-retention at
+            # all plausible RPS, so time-based deletion always wins under
+            # normal load. Bump for >5k RPS sustained.
+            KAFKA_RETENTION_BYTES: ${KAFKA_RETENTION_BYTES:-21474836480}
         command:
             - -c
             - |
@@ -1037,10 +1034,16 @@ services:
                 # auto-created topics inherit these defaults. base.yml's
                 # `--mode dev-container` silently ignores broker env vars
                 # like KAFKA_LOG_RETENTION_HOURS — cluster config still works.
-                echo "Setting cluster-level retention (ms=$$KAFKA_LOG_RETENTION_MS, segment=$$KAFKA_LOG_SEGMENT_SIZE)..."
-                rpk cluster config set log_retention_ms "$$KAFKA_LOG_RETENTION_MS" --brokers kafka:9092 || true
-                rpk cluster config set log_segment_size "$$KAFKA_LOG_SEGMENT_SIZE" --brokers kafka:9092 || true
-                rpk cluster config set log_retention_check_interval_ms 60000 --brokers kafka:9092 || true
+                #
+                # IMPORTANT: `rpk cluster config` talks to Redpanda Admin API
+                # (port 9644), NOT Kafka API. Use `-X admin.hosts=kafka:9644`,
+                # NOT `--brokers kafka:9092` (that flag does not exist for
+                # this subcommand and was silently failing under `|| true`).
+                echo "Setting cluster-level retention (ms=$$KAFKA_LOG_RETENTION_MS, segment=$$KAFKA_LOG_SEGMENT_SIZE, bytes=$$KAFKA_RETENTION_BYTES)..."
+                rpk cluster config set log_retention_ms "$$KAFKA_LOG_RETENTION_MS" -X admin.hosts=kafka:9644 || true
+                rpk cluster config set log_segment_size "$$KAFKA_LOG_SEGMENT_SIZE" -X admin.hosts=kafka:9644 || true
+                rpk cluster config set log_retention_check_interval_ms 60000 -X admin.hosts=kafka:9644 || true
+                rpk cluster config set retention_bytes "$$KAFKA_RETENTION_BYTES" -X admin.hosts=kafka:9644 || true
 
                 echo "Kafka broker is accepting requests, creating topics..."
                 # Create topics needed by rust services.
@@ -1117,6 +1120,7 @@ services:
                         --brokers kafka:9092 \
                         --set "retention.ms=$$KAFKA_LOG_RETENTION_MS" \
                         --set "segment.bytes=$$KAFKA_LOG_SEGMENT_SIZE" \
+                        --set "retention.bytes=$$KAFKA_RETENTION_BYTES" \
                         || echo "Failed to alter $$topic, continuing"
                 done
 

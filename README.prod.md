@@ -248,7 +248,7 @@ on a default hobby install.
 | `objectstorage` ports rebound to `127.0.0.1:` | prod.yml | Hobby exposes MinIO admin console + API on `0.0.0.0:19000-19001` with default `object_storage_root_user`/`password`. Caddy already proxies the public `/posthog/*` path internally — no need for direct port exposure. |
 | `temporal` + `temporal-ui` ports rebound to `127.0.0.1:` | prod.yml | Hobby exposes Temporal gRPC (`:7233`) and Web UI (`:8081`) on `0.0.0.0` with no auth. Anyone with the host IP can `tctl` workflow histories, cancel jobs, or start new ones. Tunnel via SSH when you need to debug. |
 | `<<: *restart-prod` (`unless-stopped`) on all long-running services | prod.yml | Base.yml uses `restart: on-failure`, which does NOT restart on clean exit (code 0). Some ingestion services exit cleanly under specific conditions and stay down without this. |
-| `kafka-init` enhanced with `rpk cluster config set log_retention_ms` + topic-level `alter-config` | prod.yml | base.yml's `--mode dev-container` silently ignores broker-level retention env vars. Without cluster + topic-level overrides, Redpanda disk usage grows linearly until full. |
+| `kafka-init` enhanced with `rpk cluster config set` (Admin API on `:9644`) + per-topic `rpk topic alter-config` (Kafka API on `:9092`) for `log_retention_ms` / `log_segment_size` / `retention_bytes` | prod.yml | base.yml's `--mode dev-container` silently ignores broker-level Bitnami `KAFKA_LOG_RETENTION_*` env vars. Without cluster + topic-level overrides, Redpanda defaults to 7-day time retention and unlimited size — disk fills up linearly. `retention_bytes` is the hard ceiling for runaway-producer protection (default 20 GiB / partition; comfortably above 6 h time retention at normal RPS, so time-based deletion always wins). |
 | ClickHouse `system_log` TTLs via `docker/clickhouse/config.d.prod/system_log_ttl.xml` | new file, mounted in prod.yml | Without TTLs, `query_log` / `trace_log` / `metric_log` / `part_log` grow unbounded — tens of GB in a few weeks on a busy install. Now 7d retention, hardcoded in the XML overlay (CH config layer doesn't interpolate `${ENV_VARS}` from compose). To change, edit the XML and `docker compose restart clickhouse`. There is intentionally **no** `CLICKHOUSE_SYSTEM_LOG_TTL_DAYS` env var — the previous one was dead config. |
 | ClickHouse memory caps via `docker/clickhouse/config.d.prod/memory_limits.xml` | new file, mounted in prod.yml | Upstream `config.xml` sets `max_server_memory_usage_to_ram_ratio=0.9`. On a 30 GB box that means CH eats 27 GB and OOM-kills the rest of the stack under any load. Overlay caps to 8 GB hard limit + tightens `max_thread_pool_size` from 10000 (sized for 64-core servers) to 1000. |
 | Per-service `mem_limit` via YAML anchors | prod.yml top-of-file | Without these, a single runaway container takes the whole box. Sized for 30 GB / 8 cores. Sum of caps (~35 GB) intentionally overcommits — caps are spike absorbers, not reservations. 4 GB host swap (see `bin/setup-swap`) backstops simultaneous peaks. |
@@ -361,10 +361,18 @@ Optional:
 - `OPT_OUT_CAPTURE` — disable PostHog's own telemetry (recommended: `true`)
 - `SEAWEEDFS_DOCKER_NAME`, `DOCKER_REGISTRY_PREFIX` — niche overrides
 - `CLICKHOUSE_SERVER_IMAGE` — pin CH version (default `26.3.9.8`)
-- `KAFKA_LOG_RETENTION_MS` — Redpanda retention in ms (default: 6h =
-  21600000). Wired via `--set redpanda.log_retention_ms` on the kafka
-  service. NOTE: Bitnami-style `KAFKA_LOG_RETENTION_*` env vars are
-  silently ignored by Redpanda — only this single override works.
+- `KAFKA_LOG_RETENTION_MS` — time retention (default `21600000` = 6 h).
+- `KAFKA_LOG_SEGMENT_SIZE` — segment size in bytes (default `134217728` = 128 MiB).
+- `KAFKA_RETENTION_BYTES` — per-partition disk cap (default `21474836480` = 20 GiB).
+  Hard ceiling against runaway producers; well above 6 h time-retention at
+  normal RPS so time-based deletion always wins. Bump for sustained >5k RPS.
+  All three are applied at every container boot by `kafka-init` via
+  `rpk cluster config set` (Admin API on `kafka:9644`) **and** `rpk topic
+  alter-config` (Kafka API) for already-created topics. Live tweaks:
+  `docker exec posthog-kafka-1 rpk cluster config set log_retention_ms <ms>`.
+  NOTE: Bitnami-style `KAFKA_LOG_RETENTION_*` env vars on the broker
+  itself are ignored under Redpanda's `--mode dev-container`; only the
+  `kafka-init` flow above takes effect.
 - `KAFKA_INGESTION_PARTITIONS` — partitions on `events_plugin_ingestion`
   family (default 4 = 1 per `ingestion-general` replica). Grow before
   scaling replicas — Kafka cannot shrink partitions.
