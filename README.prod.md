@@ -9,7 +9,7 @@ deployment that you can patch and redeploy from `git`.
 | Path                          | Purpose                                                 |
 |-------------------------------|---------------------------------------------------------|
 | `docker-compose.prod.yml`     | Production compose file (forked from `docker-compose.hobby.yml`) |
-| `bin/setup-prod`              | Idempotent per-host bootstrap (orchestrator, ~80 lines) |
+| `bin/setup-prod`              | Idempotent per-host bootstrap (orchestrator, ~70 lines) |
 | `bin/lib/setup-prod-*.sh`     | Phase implementations sourced by the orchestrator       |
 | `.env.example.prod`           | Template for `.env` (manual, NOT generated)             |
 | `compose/start`               | Web entrypoint (created by `setup-prod`)                |
@@ -78,7 +78,9 @@ docker compose up -d --build --force-recreate web
    `.env` is missing keys that exist in `.env.example.prod` (schema drift after
    `git pull`).
 2. **Pre-flight checks** — verifies `docker` + `docker compose` v2 are
-   installed and the daemon is reachable; warns if RAM &lt; 8 GB or disk &lt; 50 GB.
+   installed and the daemon is reachable; warns if RAM &lt; 16 GB, swap &lt; 2 GB,
+   or disk free &lt; 150 GB. Thresholds match the actual mem_limit budget
+   (~30 GB sum across services + ~25 GB transient build cost).
 3. **Generates `compose/start`, `compose/temporal-django-worker`, `compose/wait`**
    — only if they don't already exist (so your edits survive re-runs).
 4. **Downloads `share/GeoLite2-City.mmdb`** — only if missing. Auto-installs
@@ -227,14 +229,15 @@ on a default hobby install.
 | `temporal` + `temporal-ui` ports rebound to `127.0.0.1:` | prod.yml | Hobby exposes Temporal gRPC (`:7233`) and Web UI (`:8081`) on `0.0.0.0` with no auth. Anyone with the host IP can `tctl` workflow histories, cancel jobs, or start new ones. Tunnel via SSH when you need to debug. |
 | `<<: *restart-prod` (`unless-stopped`) on all long-running services | prod.yml | Base.yml uses `restart: on-failure`, which does NOT restart on clean exit (code 0). Some ingestion services exit cleanly under specific conditions and stay down without this. |
 | `kafka-init` enhanced with `rpk cluster config set log_retention_ms` + topic-level `alter-config` | prod.yml | base.yml's `--mode dev-container` silently ignores broker-level retention env vars. Without cluster + topic-level overrides, Redpanda disk usage grows linearly until full. |
-| ClickHouse `system_log` TTLs via `docker/clickhouse/config.d.prod/system_log_ttl.xml` | new file, mounted in prod.yml | Without TTLs, `query_log` / `trace_log` / `metric_log` / `part_log` grow unbounded — tens of GB in a few weeks on a busy install. Now 7d retention. |
+| ClickHouse `system_log` TTLs via `docker/clickhouse/config.d.prod/system_log_ttl.xml` | new file, mounted in prod.yml | Without TTLs, `query_log` / `trace_log` / `metric_log` / `part_log` grow unbounded — tens of GB in a few weeks on a busy install. Now 7d retention, hardcoded in the XML overlay (CH config layer doesn't interpolate `${ENV_VARS}` from compose). To change, edit the XML and `docker compose restart clickhouse`. There is intentionally **no** `CLICKHOUSE_SYSTEM_LOG_TTL_DAYS` env var — the previous one was dead config. |
 | ClickHouse memory caps via `docker/clickhouse/config.d.prod/memory_limits.xml` | new file, mounted in prod.yml | Upstream `config.xml` sets `max_server_memory_usage_to_ram_ratio=0.9`. On a 30 GB box that means CH eats 27 GB and OOM-kills the rest of the stack under any load. Overlay caps to 8 GB hard limit + tightens `max_thread_pool_size` from 10000 (sized for 64-core servers) to 1000. |
 | Per-service `mem_limit` via YAML anchors | prod.yml top-of-file | Without these, a single runaway container takes the whole box. Sized for 30 GB / 8 cores. Sum of caps (~35 GB) intentionally overcommits — caps are spike absorbers, not reservations. 4 GB host swap (see `bin/setup-swap`) backstops simultaneous peaks. |
 | Redis raised from 200 MB to 1 GB + `volatile-lru` policy | prod.yml | Base.yml's 200 MB / `allkeys-lru` is too small for an instance that's also Celery broker + result backend + hypercache + flag cache + session-replay state. `allkeys-lru` evicts in-flight Celery messages under pressure; `volatile-lru` only evicts keys with TTL (caches), so queues survive. |
 | Postgres tuning via `command:` overrides (`shared_buffers=1GB` etc.) | prod.yml + `.env` | Image defaults (`shared_buffers=128MB`) are sized for embedded use. PG gets a 4 GB cgroup (with 5 GB swap headroom for transient `work_mem × max_connections` spikes — worst case ~5.5 GB at 200 conns × 16 MB sort/hash). Tunable via `POSTGRES_*` in `.env` without rebuilding. Lower `POSTGRES_MAX_CONNECTIONS` to 120 if you also want to lower the cgroup cap. |
 | Postgres write-throughput tuning (`synchronous_commit=off`, `max_wal_size=4GB`, autovacuum) | prod.yml + `.env` | Default fsync-on-commit + 1GB WAL + 5min checkpoints stalls writers under sustained ingest. New defaults give 3-5x write throughput at the cost of losing the last <200ms of unflushed transactions on a crash — acceptable for analytics (events replay from Kafka's 6h retention). NOT acceptable if you store anything you can't re-derive: flip `POSTGRES_SYNCHRONOUS_COMMIT=on` in `.env`. |
-| `ingestion-general` runs with `replicas: 2` | prod.yml | Single replica saturates around 1k events/s on this hardware (person-resolution + Postgres + ClickHouse writes). Two consumers in the same group parallelize work because Rust capture partitions Kafka by `{token}:{distinct_id}` — same user always lands on same partition, so per-user ordering survives. |
-| `events_plugin_ingestion` + `_overflow` pre-created with 3 partitions | prod.yml `kafka-init` | Redpanda auto-creates topics with 1 partition by default; with only 1 partition, the second `ingestion-general` replica sits idle in standby. 3 partitions = 2 active consumers + 1 spare for rebalances. Tunable via `KAFKA_INGESTION_PARTITIONS` for higher replica counts. |
+| `ingestion-general` runs with `replicas: 4` | prod.yml | Single Node consumer caps around 3-5k msgs/s (person-resolution + Postgres + ClickHouse writes). Four replicas = ~12-20k sustained. Same-user ordering survives because Rust capture partitions Kafka by `{token}:{distinct_id}` — every event for one user always lands on the same partition, so N consumers in the same group safely parallelize as long as Kafka has ≥N partitions. |
+| `capture` runs with `replicas: 3` | prod.yml | Single Rust capture process is bounded by one CPU core (~5-10k req/s). Three replicas use ~3 cores, leaving room for kafka, ingestion-general, and ClickHouse query cores on an 8-core box. Caddy round-robins across them via compose DNS. Bump to 4-6 if loadtest shows capture CPU >80% across all replicas. |
+| `events_plugin_ingestion` + `_overflow` + `_historical` pre-created with 4 partitions | prod.yml `kafka-init` | Redpanda auto-creates topics with 1 partition by default; with 1 partition, 3 of the 4 `ingestion-general` replicas sit idle. 4 partitions = 1 partition per replica under cooperative-sticky assignment. `_historical` is included so `batch-import-worker` (Mixpanel/Amplitude backfills) gets the same parallelism instead of bottlenecking through 1 auto-created partition. Tunable via `KAFKA_INGESTION_PARTITIONS` (kafka-init only ever GROWS partitions, never shrinks). |
 | Kafka retention raised from 1 h → 6 h | prod.yml | 1 h is enough for normal operation but a 1 h overnight outage drops events. 6 h is the cheapest "I can sleep through a consumer crash" buffer. |
 | `CLICKHOUSE_SERVER_IMAGE` pinning via `.env` | prod.yml | Reproducible deploys; prevents silent CH version drift across hosts. |
 | `POSTHOG_DB_PASSWORD`, `OBJECT_STORAGE_PASSWORD`, `CLICKHOUSE_PASSWORD` from `.env` | `.env.example.prod`, prod.yml, `docker/clickhouse/users.d.prod/default-password.xml` | Hobby ships with well-known defaults (`posthog`/`posthog`, empty CH `default`, `object_storage_root_password`). Anyone with shell or `docker exec` access on the host can dump data with these. See [Credentials](#credentials) below. |
@@ -339,8 +342,10 @@ Optional:
 - `SEAWEEDFS_DOCKER_NAME`, `DOCKER_REGISTRY_PREFIX` — niche overrides
 - `CLICKHOUSE_SERVER_IMAGE` — pin CH version (default `26.3.9.8`)
 - `KAFKA_LOG_RETENTION_MS`, `KAFKA_LOG_SEGMENT_SIZE` — Redpanda retention
-  (defaults: 1h / 128 MB)
-- `CLICKHOUSE_SYSTEM_LOG_TTL_DAYS` — CH `system_log` TTL (default 7)
+  (defaults: 6h / 128 MB)
+- `KAFKA_INGESTION_PARTITIONS` — partitions on `events_plugin_ingestion`
+  family (default 4 = 1 per `ingestion-general` replica). Grow before
+  scaling replicas — Kafka cannot shrink partitions.
 - `POSTHOG_LOG_ENTRIES_TTL_DAYS` — Hog function logs TTL (default 14)
 - `POSTHOG_QUERY_LOG_ARCHIVE_TTL_DAYS` — query archive TTL (default 30)
 
@@ -353,7 +358,7 @@ Optional:
 
 ### Host-level setup (one-time, not in setup-prod)
 
-`bin/setup-prod` warns if RAM < 16 GB, swap < 2 GB, or disk free < 100 GB but
+`bin/setup-prod` warns if RAM < 16 GB, swap < 2 GB, or disk free < 150 GB but
 doesn't fix them — those changes need root and modify `/etc/fstab`, and
 some VPS types (LXC, restricted Docker hosts) forbid user-controlled swap.
 Run these explicitly:
@@ -416,24 +421,30 @@ hits the docker OOM-killer (which is unrecoverable) — instead it throws
 
 ### Scaling ingestion-general
 
-The default config runs `ingestion-general` with `replicas: 2`, parallelized
-via 3 Kafka partitions on `events_plugin_ingestion` and its overflow topic.
-Each replica is capped at 1.5 GB. Capacity ceiling is roughly **2-3k
-events/s sustained** on this hardware, depending on hog functions / person
-resolution cache hit rate.
+The default config runs `ingestion-general` with `replicas: 4` and
+`KAFKA_INGESTION_PARTITIONS=4` — exactly 1 partition per consumer under
+cooperative-sticky assignment. Each replica is capped at 1.5 GB (6 GB
+total). Capacity ceiling is roughly **12-20k msgs/s sustained**, bounded
+in practice by Postgres person-resolution + ClickHouse persistence rather
+than the Node consumer itself.
 
-To scale further:
+The 4/4 baseline is the recommended setpoint for 30 GB / 8-core hardware.
+Consumer lag growing on `events_plugin_ingestion` while ingestion-general
+sits at <60% CPU usually means PG is the bottleneck, not Kafka — see
+[Postgres write contention](#postgres-write-contention) before adding replicas.
+
+To scale beyond the default (only after upgrading hardware):
 
 ```yaml
-# docker-compose.prod.yml
+# docker-compose.prod.yml — keep replicas == partitions
 ingestion-general:
     deploy:
-        replicas: 4
+        replicas: 6
 ```
 
 ```bash
-# .env — partitions = replicas + 1 for rebalance headroom
-KAFKA_INGESTION_PARTITIONS=5
+# .env — must be >= replicas. Kafka can ONLY grow partitions, not shrink.
+KAFKA_INGESTION_PARTITIONS=6
 ```
 
 Then:
@@ -443,9 +454,10 @@ docker compose up -d ingestion-general
 docker compose restart kafka-init   # idempotently grows partitions in place
 ```
 
-Costs: each replica adds 1.5 GB to the cgroup budget. At 4 replicas you're
-adding 4.5 GB on top of the existing 3 GB — keep an eye on `docker stats`
-and free disk for the extra Kafka partition data (~20-50 MB per partition).
+Cost per added replica: +1.5 GB cgroup budget, +30 PG connections at peak
+(lower `POSTGRES_MAX_CONNECTIONS` headroom), +20-50 MB Kafka log per new
+partition. Don't go above replicas == partitions — extra replicas just sit
+idle in standby (one consumer per partition is the Kafka ceiling).
 
 ### Postgres write contention
 
@@ -526,19 +538,15 @@ Realistic numbers for the box-sized config (30 GB / 8 cores):
 
 | Metric | Sustained | Burst | Bottleneck |
 |---|---|---|---|
-| `/capture` req/s | 5 000-10 000 | 20 000+ | Rust capture is fast; Kafka write |
-| Events/s persisted to CH | 500-2 000 | 5 000 | `ingestion-general` CPU + Postgres person resolution |
+| `/capture` req/s | 15 000-30 000 | 60 000+ | 3 capture replicas × ~5-10k/replica; then Kafka write |
+| Events/s through `ingestion-general` | 12 000-20 000 | 25 000+ | 4 replicas × 3-5k Node consumers each |
+| Events/s persisted to CH | 2 000-5 000 | 8 000 | Postgres person resolution (`posthog_person*` write contention) |
 | Concurrent insight queries | 5-10 | 20 | ClickHouse memory + CPU |
 
 If Kafka consumer lag grows monotonically across the test → `ingestion-general`
-is overloaded; bump its replicas in `docker-compose.prod.yml`:
-
-```yaml
-    ingestion-general:
-        # ... existing ...
-        deploy:
-            replicas: 2
-```
+is overloaded. Default is already `replicas: 4` matched to 4 partitions; to go
+higher, follow [Scaling ingestion-general](#scaling-ingestion-general) above
+(replicas and `KAFKA_INGESTION_PARTITIONS` move together).
 
 ---
 
