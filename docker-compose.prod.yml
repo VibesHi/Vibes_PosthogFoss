@@ -683,9 +683,16 @@ services:
         volumes:
             - caddy-data:/data
             - caddy-config:/config
-        environment:
-            CADDY_TLS_BLOCK: $TLS_BLOCK
-            CADDY_HOST: '$DOMAIN, http://, https://'
+        # NOTE: do NOT add an `environment:` block here for CADDY_HOST or
+        # CADDY_TLS_BLOCK. base.yml's CADDYFILE template references
+        # ${CADDY_HOST:-...} / ${CADDY_TLS_BLOCK:-} which compose substitutes
+        # at YAML parse time from .env -- before the container even exists.
+        # The entrypoint then writes the already-substituted CADDYFILE to
+        # /etc/caddy/Caddyfile and runs caddy with it. Container runtime env
+        # vars are never read by caddy. Set CADDY_HOST and CADDY_TLS_BLOCK in
+        # .env (see .env.example.prod). Verified end-to-end via
+        # `docker compose config` -- divergent .env vs prod-override values
+        # always resolve to the .env value in the rendered Caddyfile.
         depends_on:
             - web
             - livestream

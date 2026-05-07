@@ -9,7 +9,8 @@ deployment that you can patch and redeploy from `git`.
 | Path                          | Purpose                                                 |
 |-------------------------------|---------------------------------------------------------|
 | `docker-compose.prod.yml`     | Production compose file (forked from `docker-compose.hobby.yml`) |
-| `bin/setup-prod`              | Idempotent per-host bootstrap script                    |
+| `bin/setup-prod`              | Idempotent per-host bootstrap (orchestrator, ~80 lines) |
+| `bin/lib/setup-prod-*.sh`     | Phase implementations sourced by the orchestrator       |
 | `.env.example.prod`           | Template for `.env` (manual, NOT generated)             |
 | `compose/start`               | Web entrypoint (created by `setup-prod`)                |
 | `compose/temporal-django-worker` | Temporal worker entrypoint (created by `setup-prod`) |
@@ -31,12 +32,22 @@ bin/setup-prod
 
 ```bash
 cp .env.example.prod .env
-sed -i.bak 's|CHANGE_ME_your.domain.tld|posthog.example.com|' .env
-sed -i.bak "s|CHANGE_ME_run_openssl_rand_hex_32|$(openssl rand -hex 32)|" .env
-sed -i.bak "s|CHANGE_ME_run_openssl_rand_hex_16|$(openssl rand -hex 16)|" .env
-sed -i.bak "s|CHANGE_ME_postgres_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
-sed -i.bak "s|CHANGE_ME_minio_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
-sed -i.bak "s|CHANGE_ME_clickhouse_openssl_rand_hex_24|$(openssl rand -hex 24)|" .env
+
+# DOMAIN appears twice (DOMAIN= and inside CADDY_HOST=)
+DOMAIN_NEW=posthog.example.com
+sed -i.bak "s|CHANGE_ME_your.domain.tld|${DOMAIN_NEW}|g" .env
+
+# POSTHOG_SECRET (Django SECRET_KEY) -- 64 hex chars
+sed -i.bak "0,/CHANGE_ME_openssl_rand_hex_32/s||$(openssl rand -hex 32)|" .env
+
+# ENCRYPTION_SALT_KEYS (Fernet input) -- MUST be 32 chars, hence hex 16
+sed -i.bak "0,/CHANGE_ME_openssl_rand_hex_16/s||$(openssl rand -hex 16)|" .env
+
+# Three independent passwords -- 0,/.../ replaces only the first match each time
+for _ in 1 2 3; do
+    sed -i.bak "0,/CHANGE_ME_openssl_rand_hex_24/s||$(openssl rand -hex 24)|" .env
+done
+
 rm .env.bak
 bin/setup-prod
 ```
@@ -314,6 +325,7 @@ explicit regression checks for these patches.
 `.env.example.prod` lists everything. Required:
 
 - `DOMAIN` — your hostname
+- `CADDY_HOST` — Caddy listener spec; must contain `DOMAIN` literally (no `${}` expansion in `.env`). Example: `"posthog.example.com, http://, https://"`
 - `POSTHOG_SECRET` — Django secret (`openssl rand -hex 32`)
 - `ENCRYPTION_SALT_KEYS` — token encryption (`openssl rand -hex 16`)
 - `POSTHOG_DB_PASSWORD` — Postgres `posthog` user (`openssl rand -hex 24`)
@@ -322,7 +334,7 @@ explicit regression checks for these patches.
 
 Optional:
 
-- `TLS_BLOCK` — Caddy custom TLS config (empty = auto Let's Encrypt)
+- `CADDY_TLS_BLOCK` — Caddy custom TLS directives (empty = auto Let's Encrypt)
 - `OPT_OUT_CAPTURE` — disable PostHog's own telemetry (recommended: `true`)
 - `SEAWEEDFS_DOCKER_NAME`, `DOCKER_REGISTRY_PREFIX` — niche overrides
 - `CLICKHOUSE_SERVER_IMAGE` — pin CH version (default `26.3.9.8`)
