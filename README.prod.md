@@ -6,6 +6,8 @@ deployment that you can patch and redeploy from `git`.
 
 ## Files
 
+### Boot / runtime
+
 | Path                          | Purpose                                                 |
 |-------------------------------|---------------------------------------------------------|
 | `docker-compose.prod.yml`     | Production compose file (forked from `docker-compose.hobby.yml`) |
@@ -16,6 +18,24 @@ deployment that you can patch and redeploy from `git`.
 | `compose/temporal-django-worker` | Temporal worker entrypoint (created by `setup-prod`) |
 | `compose/wait`                | TCP wait-for-deps script (created by `setup-prod`)      |
 | `share/GeoLite2-City.mmdb`    | GeoIP database (downloaded by `setup-prod`)             |
+
+### Operations (gated by `COMPOSE_PROFILES`)
+
+| Path                                            | Purpose                                                                                                  |
+|-------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| [`docker/backup/`](docker/backup/README.md)     | DR backups — daily PG dump + CH partitions to GCS, profile `backup`. See [Backups](#backups).            |
+| [`docker/posthog-events-export/`](docker/posthog-events-export/README.md) | Daily Mixpanel-shape JSONL.gz event archive to GCS, profile `events-export`. See [Events export](#events-export). |
+| [`ee/scripts/posthog_events_export/`](ee/scripts/posthog_events_export/README.md) | Python script behind `events-export` (schema mapping, CLI flags, manual backfills).                      |
+
+### Migration tooling (one-shot, no profile)
+
+Used during Mixpanel → PostHog historical import. Not part of steady-state ops. See [Mixpanel migration](#mixpanel-migration).
+
+| Path                                                                  | Purpose                                                                                |
+|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| [`ee/scripts/mixpanel_export/`](ee/scripts/mixpanel_export/README.md) | Pulls historical events FROM the Mixpanel Export API to GCS as monthly `.jsonl.gz`.    |
+| [`ee/scripts/mixpanel_splitter/`](ee/scripts/mixpanel_splitter/README.md) | Cloud Run Job that splits Mixpanel monthly files into per-day `.jsonl.gz`.             |
+| [`ee/scripts/mixpanel_import/RUNBOOK.md`](ee/scripts/mixpanel_import/RUNBOOK.md) | End-to-end runbook: GCS → `batch-import-worker` → Kafka → ClickHouse.                  |
 
 ## First-run
 
@@ -639,5 +659,31 @@ COMPOSE_PROFILES=backup,events-export
 
 docker compose --profile events-export up -d --build posthog-events-export
 ```
+
+---
+
+## Mixpanel migration
+
+One-shot historical import: pull events from Mixpanel, stage in GCS, replay
+into this PostHog instance via `batch-import-worker`. Idempotent end-to-end
+(Mixpanel `$insert_id` → deterministic UUIDv5 → ClickHouse `ReplacingMergeTree`
+dedup), so reruns are safe.
+
+Three stages, each with its own README:
+
+1. **Export** — [`ee/scripts/mixpanel_export/README.md`](ee/scripts/mixpanel_export/README.md):
+   Python script that streams the Mixpanel Export API to GCS as `.jsonl.gz`.
+2. **Split** — [`ee/scripts/mixpanel_splitter/README.md`](ee/scripts/mixpanel_splitter/README.md):
+   Cloud Run Job that fans out monthly files into per-day `.jsonl.gz` files
+   (the granularity `batch-import-worker` consumes).
+3. **Import** — [`ee/scripts/mixpanel_import/RUNBOOK.md`](ee/scripts/mixpanel_import/RUNBOOK.md):
+   the operator runbook — preflight checks, kicking off `batch-import-worker`
+   under the `migration` compose profile, monitoring Kafka lag, verifying
+   ClickHouse counts, cleanup. Read this end-to-end before starting.
+
+Output of stage 2 is structurally identical to what `events-export` produces
+(Mixpanel-shape JSONL.gz), so the same `batch-import-worker` consumes both —
+restoring an `events-export` archive uses the same Phase 2-onwards path as
+the Mixpanel migration runbook.
 
 ---
