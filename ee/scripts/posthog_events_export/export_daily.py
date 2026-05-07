@@ -194,8 +194,14 @@ class ClickHouse:
 
 
 def discover_teams_sql(database: str, day: dt.date) -> str:
+    # NB: do NOT alias `toString(team_id) AS team_id`. CH 26.3+ substitutes
+    # the alias back into ORDER BY / WHERE on subsequent passes, which both
+    # turns ORDER BY into a lex sort ("10" < "2") AND breaks any future
+    # WHERE-on-team_id we might add. JSONEachRow quotes Int64 by default
+    # (`output_format_json_quote_64bit_integers=1`), so the wire format
+    # is the same string we'd have gotten from toString anyway.
     return f"""
-SELECT DISTINCT toString(team_id) AS team_id
+SELECT DISTINCT team_id
 FROM {database}.sharded_events
 WHERE timestamp >= toDateTime('{day:%Y-%m-%d} 00:00:00', 'UTC')
   AND timestamp <  toDateTime('{day:%Y-%m-%d} 00:00:00', 'UTC') + INTERVAL 1 DAY
@@ -208,15 +214,21 @@ def export_events_sql(database: str, team_id: int, day: dt.date, *, final: bool)
     # `FINAL` deduplicates ReplacingMergeTree rows but is 3-10× slower; off by
     # default, see module docstring.
     final_clause = "FINAL" if final else ""
+    # CH 26.3+ alias-shadowing trap: aliasing `toString(team_id) AS team_id`
+    # makes the optimizer rewrite `WHERE team_id = N` to `WHERE toString(team_id) = N`,
+    # which fails with `Code: 386 NO_COMMON_TYPE: String vs UInt8`. Same trap
+    # applies to `uuid` and `person_id` if anyone later filters on them.
+    # Solution: never reuse a column name as an alias for a projected expression.
+    # We use `_str` suffixes for the casted projections instead.
     return f"""
 SELECT
-    toString(uuid)                                                          AS uuid,
-    event                                                                   AS event,
-    properties                                                              AS properties,
-    toUnixTimestamp(timestamp, 'UTC')                                       AS time,
-    toString(team_id)                                                       AS team_id,
-    distinct_id                                                             AS distinct_id,
-    if(person_id != toUUID('{ZERO_UUID}'), toString(person_id), '')         AS person_id
+    toString(uuid)                                                              AS uuid_str,
+    event,
+    properties,
+    toUnixTimestamp(timestamp, 'UTC')                                           AS time,
+    team_id,
+    distinct_id,
+    if(person_id != toUUID('{ZERO_UUID}'), toString(person_id), '')             AS person_id_str
 FROM {database}.sharded_events {final_clause}
 WHERE team_id = {team_id}
   AND timestamp >= toDateTime('{day:%Y-%m-%d} 00:00:00', 'UTC')
@@ -233,10 +245,17 @@ def to_mixpanel_shape(row: dict) -> Optional[dict]:
     """CH JSONEachRow row → {event, properties:{time, distinct_id, $insert_id, ...}}.
 
     Returns None for malformed rows (missing required fields). The caller
-    counts these as `invalid`."""
+    counts these as `invalid`.
+
+    Wire-format gotchas to know about:
+      * `team_id` is Int64; CH JSONEachRow quotes 64-bit ints by default
+        (`output_format_json_quote_64bit_integers=1`), so `row["team_id"]`
+        is a STRING like "2", not int 2. `int(...)` handles either.
+      * `uuid_str` / `person_id_str` are aliased that way to avoid
+        alias-shadowing ORDER BY / WHERE in CH 26.3+ (see export_events_sql)."""
     event = row.get("event")
     distinct_id = row.get("distinct_id")
-    uuid = row.get("uuid")
+    uuid = row.get("uuid_str")
     if not event or not distinct_id or not uuid:
         return None
 
@@ -269,7 +288,7 @@ def to_mixpanel_shape(row: dict) -> Optional[dict]:
         # `--team-id` flag flip, not a sed-the-files job.
         "team_id": int(row["team_id"]),
     }
-    person_id = row.get("person_id") or ""
+    person_id = row.get("person_id_str") or ""
     if person_id:
         out_props["$user_id"] = person_id
 
