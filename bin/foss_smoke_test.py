@@ -213,7 +213,23 @@ except Exception as e:
     failures.append(f"MATERIALIZED COLUMNS PROBE FAIL: {type(e).__name__}: {e}")
 
 # -------------------------------------------------------------------
-# 7) URL resolver: confirm routes exist (don't hit them, just resolve).
+# 7) EnterprisePropertyDefinition shim must raise ImportError on attribute
+#    access. posthog/api/event.py:_is_property_hidden depends on it (sole
+#    ungated EE import in upstream). Regression -> /api/event/values 500s
+#    with FieldError -> "Failed to load property values" toast.
+# -------------------------------------------------------------------
+try:
+    from ee.models.property_definition import EnterprisePropertyDefinition  # noqa: F401
+
+    failures.append(
+        "ENTERPRISE_PROPERTY_DEFINITION SHIM REGRESSION: import did not raise ImportError "
+        "(see ee/models/property_definition.py)"
+    )
+except ImportError:
+    pass
+
+# -------------------------------------------------------------------
+# 8) URL resolver: confirm routes exist (don't hit them, just resolve).
 # -------------------------------------------------------------------
 try:
     from django.urls import resolve
@@ -253,7 +269,7 @@ else:
         f"{len(EE_IMPORTS)} imports, "
         f"{sum(len(v) for v in EXPECTED_MIXIN_METHODS.values())} mixin methods, "
         f"{len(ORM_PROBES)} ORM probes, 1 reverse-FK, 1 org-feature, "
-        f"1 materialized-columns probe, "
+        f"1 materialized-columns probe, 1 enterprise-property-shim probe, "
         f"{len(URL_PROBES)} URL probes)"
     )
     sys.exit(0)
