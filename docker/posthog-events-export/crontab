@@ -1,0 +1,33 @@
+# PostHog daily events export schedule -- runs inside the
+# `posthog-events-export` container.
+#
+# All times UTC (TZ env var below). 06:00 UTC chosen specifically AFTER
+# the backup container's 05:30 cleanup tick so the two containers don't
+# fight for ClickHouse HTTP connections during the disk-write window.
+#
+# `flock -n` prevents re-entry: if a previous run is still going (e.g. a
+# huge multi-team daily stream is still uploading), the new tick is
+# skipped silently rather than queuing up.
+#
+# 2>&1 routes script stderr to crond stdout, which crond -f forwards to
+# PID-1 stdout, which docker captures into
+# `docker compose logs posthog-events-export`.
+#
+# Edit and rebuild the image after changing this file:
+#   docker compose --profile events-export build posthog-events-export
+#   docker compose --profile events-export up -d posthog-events-export
+
+TZ=UTC
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# minute hour dom mon dow command
+
+# Daily events export at 06:00 UTC. Streams yesterday's events from CH
+# for every active team, writes one .jsonl.gz per (team, day) to GCS.
+# Typical run on a small install: ~30s. Backfill / large team can take
+# many minutes — flock keeps the next tick from stomping on it.
+0 6 * * *   flock -n /tmp/events-export.lock /usr/local/bin/events-export-scripts/export-events.sh   2>&1
+
+# crond REQUIRES a trailing newline -- empty line below is intentional.
+

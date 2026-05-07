@@ -1,0 +1,7 @@
+requests>=2.32.0
+fsspec>=2024.2.0
+# Pick one or more depending on where you want to write output.
+# fsspec resolves the URL scheme to the right backend lazily — local paths
+# need no extra dep at all.
+gcsfs>=2024.2.0  # gs://...
+s3fs>=2024.2.0   # s3://... (also works for R2, MinIO, GCS interop via endpoint_url)

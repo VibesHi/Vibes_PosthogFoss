@@ -595,3 +595,29 @@ the exact stop command and exit non-zero rather than corrupting state.
 > are unrecoverable.
 
 ---
+
+## Events export
+
+Daily Mixpanel-shape JSONL.gz of `posthog.sharded_events` to a SEPARATE
+GCS bucket, one file per (team, day), forever-retained. Different bucket,
+HMAC pair, and lifecycle from the disaster-recovery Backups above —
+analytical archive, not DR. See
+[`docker/posthog-events-export/README.md`](docker/posthog-events-export/README.md)
+for the full operator manual (enable, force a run, verify, restore,
+schedule, retention) and
+[`ee/scripts/posthog_events_export/README.md`](ee/scripts/posthog_events_export/README.md)
+for the script-level docs (schema mapping, CLI flags, manual backfills).
+
+Quick enable:
+
+```bash
+# .env
+EVENTS_EXPORT_GCS_BUCKET=gs://vibes-analytics-events
+EVENTS_EXPORT_GCS_HMAC_KEY=GOOG1...
+EVENTS_EXPORT_GCS_HMAC_SECRET=...
+COMPOSE_PROFILES=backup,events-export
+
+docker compose --profile events-export up -d --build posthog-events-export
+```
+
+---

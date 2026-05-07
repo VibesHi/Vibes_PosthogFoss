@@ -1283,6 +1283,84 @@ services:
                 # backup scripts retry-tolerate CH being mid-startup.
                 condition: service_started
 
+    # Daily events export to a "forever" GCS bucket in Mixpanel-shape
+    # JSONL.gz. Gated behind the `events-export` profile -- enable with
+    # COMPOSE_PROFILES=events-export in .env (or
+    # `docker compose --profile events-export up -d posthog-events-export`).
+    # See README.prod.md "## Events export" and
+    # docker/posthog-events-export/README.md for the operator guide.
+    #
+    # Auth: dedicated HMAC interop pair scoped to the analytics bucket
+    # (EVENTS_EXPORT_GCS_HMAC_KEY / EVENTS_EXPORT_GCS_HMAC_SECRET). Kept
+    # SEPARATE from the backup container's GCS_HMAC_* pair so a leaked
+    # key only blasts one bucket.
+    #
+    # Build context is the REPO ROOT (not docker/posthog-events-export/)
+    # so the Dockerfile can COPY both the bash scripts under
+    # docker/posthog-events-export/scripts/ AND the python module under
+    # ee/scripts/posthog_events_export/.
+    #
+    # Operator entry points (run from the host):
+    #   docker compose logs -f posthog-events-export
+    #   docker compose exec posthog-events-export /usr/local/bin/events-export-scripts/status.sh
+    #   docker compose exec posthog-events-export /usr/local/bin/events-export-scripts/verify.sh
+    #   docker compose exec posthog-events-export /usr/local/bin/events-export-scripts/export-events.sh --date 2026-05-06
+    posthog-events-export:
+        profiles: [events-export]
+        # mem-storage (384m): python + fsspec + s3fs baseline is ~120MB,
+        # plus s3fs's multipart upload buffers up to ~5 chunks of 16MB
+        # = 80MB during a large per-team stream. With curl/CH HTTP
+        # streaming + gzip in the same pipeline, peak RSS during a
+        # multi-team backfill crowds 256m. 384m gives ~150% headroom.
+        <<: [*restart-prod, *mem-storage]
+        image: posthog-events-export
+        build:
+            context: .
+            dockerfile: docker/posthog-events-export/Dockerfile
+        container_name: posthog_events_export
+        logging: *default-logging
+        environment:
+            # CH creds (same as worker / web / backup).
+            CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+            CLICKHOUSE_HOST: clickhouse
+            CLICKHOUSE_PORT_HTTP: 8123
+            CLICKHOUSE_USER: default
+            CLICKHOUSE_DATABASE: posthog
+            # Dedicated HMAC pair for the analytics bucket. Create in
+            # Cloud Console under Storage > Settings > Interoperability >
+            # Create access key for service account. The SA needs
+            # roles/storage.objectAdmin on
+            # ${EVENTS_EXPORT_GCS_BUCKET:-gs://vibes-analytics-events}.
+            # Use a DIFFERENT SA from the backup HMAC so a leak of one
+            # doesn't compromise the other.
+            EVENTS_EXPORT_GCS_BUCKET:      ${EVENTS_EXPORT_GCS_BUCKET:-gs://vibes-analytics-events}
+            EVENTS_EXPORT_GCS_HMAC_KEY:    ${EVENTS_EXPORT_GCS_HMAC_KEY}
+            EVENTS_EXPORT_GCS_HMAC_SECRET: ${EVENTS_EXPORT_GCS_HMAC_SECRET}
+            EVENTS_EXPORT_GCS_REGION:      ${EVENTS_EXPORT_GCS_REGION:-auto}
+            TZ: UTC
+        volumes:
+            # Sentinel files (last-ok timestamps). Kept in a named volume
+            # so they survive `docker compose up --force-recreate
+            # posthog-events-export` for image rebuilds.
+            - posthog_events_export_state:/var/run/events-export
+        healthcheck:
+            test: ["CMD", "/usr/local/bin/events-export-scripts/healthcheck.sh"]
+            interval: 1h
+            timeout: 30s
+            retries: 1
+            # Don't go unhealthy until the first expected run is overdue.
+            # First cron tick fires at 06:00 UTC; up to 30h slack absorbs
+            # any time-zone / first-deploy timing oddity. healthcheck.sh
+            # has its own MISSING_GRACE logic on top of this.
+            start_period: 30h
+        depends_on:
+            clickhouse:
+                # CH has no Compose-level healthcheck in base.yml.
+                # `started` is the strictest condition we can express
+                # here -- the export script retries CH HTTP naturally
+                # if CH is mid-startup at cron time.
+                condition: service_started
+
 volumes:
     zookeeper-data:
     zookeeper-datalog:
@@ -1299,3 +1377,6 @@ volumes:
     # Backup container state: last-ok sentinels + pre-restore snapshots.
     # Created/used only when the `backup` profile is active.
     posthog_backup_state:
+    # Events-export container state: events-export.last-ok sentinel.
+    # Created/used only when the `events-export` profile is active.
+    posthog_events_export_state:
