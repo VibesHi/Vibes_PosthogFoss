@@ -361,8 +361,10 @@ Optional:
 - `OPT_OUT_CAPTURE` — disable PostHog's own telemetry (recommended: `true`)
 - `SEAWEEDFS_DOCKER_NAME`, `DOCKER_REGISTRY_PREFIX` — niche overrides
 - `CLICKHOUSE_SERVER_IMAGE` — pin CH version (default `26.3.9.8`)
-- `KAFKA_LOG_RETENTION_MS`, `KAFKA_LOG_SEGMENT_SIZE` — Redpanda retention
-  (defaults: 6h / 128 MB)
+- `KAFKA_LOG_RETENTION_MS` — Redpanda retention in ms (default: 6h =
+  21600000). Wired via `--set redpanda.log_retention_ms` on the kafka
+  service. NOTE: Bitnami-style `KAFKA_LOG_RETENTION_*` env vars are
+  silently ignored by Redpanda — only this single override works.
 - `KAFKA_INGESTION_PARTITIONS` — partitions on `events_plugin_ingestion`
   family (default 4 = 1 per `ingestion-general` replica). Grow before
   scaling replicas — Kafka cannot shrink partitions.

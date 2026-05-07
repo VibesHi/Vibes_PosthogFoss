@@ -327,19 +327,20 @@ services:
             - --reserve-memory 500M
             - --default-log-level=warn
             - --seeds kafka:33145
+            # Retention: 6 h. Kafka here is a buffer between Rust capture and
+            # the consumers (plugin-server, ClickHouse Kafka engine). Healthy
+            # consumers drain messages within seconds; retention only matters
+            # as a recovery window if a consumer dies. 6 h covers overnight
+            # outages on a single-host box with auto-restart.
+            #
+            # NOTE: Redpanda does NOT read KAFKA_LOG_RETENTION_* env vars
+            # (those are Bitnami Kafka conventions). Must use --set flags or
+            # `rpk cluster config set`. Default without these would be 7 days.
+            - --set redpanda.log_retention_ms=${KAFKA_LOG_RETENTION_MS:-21600000}
+            - --set redpanda.log_segment_size_jitter_percent=5
+            - --set redpanda.retention_bytes=1073741824
         depends_on:
             - zookeeper
-        # Retention defaults: 6 h ms / 6 h hours / 5 min check.
-        # Kafka here is a buffer between Rust capture and the consumers
-        # (plugin-server, ClickHouse Kafka engine). Healthy consumers drain
-        # messages within seconds; retention only matters as a recovery window
-        # if a consumer dies. 6 h covers overnight outages on a single-host
-        # box with auto-restart. Lower (1 h) saves disk; higher (24 h) gives
-        # more recovery slack at the cost of disk.
-        environment:
-            KAFKA_LOG_RETENTION_MS: ${KAFKA_LOG_RETENTION_MS:-21600000}
-            KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
-            KAFKA_LOG_RETENTION_HOURS: 6
         volumes:
             - kafka-data:/bitnami/kafka
 
