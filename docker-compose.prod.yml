@@ -904,7 +904,7 @@ services:
         logging: *default-logging
 
     property-defs-rs:
-        <<: [*restart-prod, *mem-rust]
+        <<: [*restart-prod, *mem-rust-hot]
         image: posthog-property-defs-rs
         build:
             context: ./rust
