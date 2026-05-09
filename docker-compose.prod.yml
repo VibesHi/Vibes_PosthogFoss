@@ -466,7 +466,7 @@ services:
             - seaweedfs
 
     plugins:
-        <<: [*restart-prod, *mem-node]
+        <<: [*restart-prod, *mem-node-hot]
         image: posthog-node
         build:
             context: .
