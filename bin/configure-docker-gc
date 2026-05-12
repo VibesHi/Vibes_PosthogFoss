@@ -44,8 +44,17 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "Installing jq..."
-    apt-get update -qq && apt-get install -y -qq jq
+    cat >&2 <<EOF
+ERROR: 'jq' is required for safe JSON merging but is not installed.
+
+Install it explicitly (this script avoids touching apt to prevent
+unrelated package upgrades / needrestart prompts):
+
+    apt-get install -y jq
+
+Then re-run this script.
+EOF
+    exit 1
 fi
 
 # --- Show current state ------------------------------------------------------
