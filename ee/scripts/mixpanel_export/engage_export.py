@@ -191,8 +191,36 @@ def fetch_engage_page(
     return results, returned_session_id, total
 
 
+# Sentinel strings Mixpanel/Engage sometimes serializes in place of JSON null.
+# Observed in 2026-05-12 export on Moonly: "<null>" appears in ~30%+ of profile
+# rows for $name / $email / $os when the underlying value is unset, instead of
+# JSON null. We treat them as missing values across the whole transform path.
+PLACEHOLDER_STRINGS: frozenset[str] = frozenset({"<null>", "<undefined>"})
+
+
+def _is_missing(v: Any) -> bool:
+    """True if `v` should be treated as a missing/null Person property value.
+
+    Catches:
+    - Python None
+    - empty string
+    - Mixpanel's literal "<null>" / "<undefined>" placeholders
+    Does NOT filter 0, False, [], or {} — those are legitimate values.
+    """
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v == "" or v in PLACEHOLDER_STRINGS
+    return False
+
+
 def _str_or_empty(v: Any) -> str:
-    return v.strip() if isinstance(v, str) else ""
+    if not isinstance(v, str):
+        return ""
+    s = v.strip()
+    if s in PLACEHOLDER_STRINGS:
+        return ""
+    return s
 
 
 def normalize_identity_props(set_props: dict[str, Any], raw: dict[str, Any]) -> None:
@@ -256,7 +284,7 @@ def transform_profile(profile: dict[str, Any], default_timestamp: str) -> Option
 
     # GeoIP remap first so we don't double-emit (raw + remapped).
     for src, dst in GEOIP_PROP_MAPPINGS.items():
-        if src in raw and raw[src] not in (None, ""):
+        if src in raw and not _is_missing(raw[src]):
             set_props[dst] = raw[src]
 
     for key, value in raw.items():
@@ -264,7 +292,7 @@ def transform_profile(profile: dict[str, Any], default_timestamp: str) -> Option
             continue
         if key in GEOIP_PROP_MAPPINGS:
             continue  # already moved above
-        if value is None or value == "":
+        if _is_missing(value):
             continue
         if key in SET_ONCE_KEYS:
             set_once_props[key] = value
