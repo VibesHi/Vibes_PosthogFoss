@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Configure Docker BuildKit garbage collection to cap build-cache disk usage.
+# Safe to run multiple times — backs up existing /etc/docker/daemon.json and
+# deep-merges the GC policy with whatever else is already there.
+#
+# Usage:
+#   sudo bash configure-docker-gc.sh           # interactive (asks before write)
+#   sudo bash configure-docker-gc.sh --apply   # non-interactive
+#
+# After it writes the file, restart Docker yourself when ready:
+#   systemctl restart docker
+# Verify with:
+#   docker info | sed -n '/Builder/,/^$/p'
+
+set -euo pipefail
+
+DAEMON_JSON="/etc/docker/daemon.json"
+APPLY="${1:-}"
+
+# What we want to ensure exists. Deep-merged into existing config.
+read -r -d '' GC_PATCH <<'JSON' || true
+{
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "policy": [
+        {
+          "keepDuration": "168h",
+          "reservedSpace": "10GB",
+          "maxUsedSpace": "50GB",
+          "all": true
+        }
+      ]
+    }
+  }
+}
+JSON
+
+# --- Pre-flight --------------------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: must run as root (writes /etc/docker/daemon.json)" >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Installing jq..."
+    apt-get update -qq && apt-get install -y -qq jq
+fi
+
+# --- Show current state ------------------------------------------------------
+
+echo "=== Docker server version ==="
+docker version --format '{{.Server.Version}}' || {
+    echo "ERROR: docker daemon not reachable" >&2
+    exit 1
+}
+
+echo
+echo "=== Current $DAEMON_JSON ==="
+if [[ -f "$DAEMON_JSON" ]]; then
+    if jq empty "$DAEMON_JSON" 2>/dev/null; then
+        jq . "$DAEMON_JSON"
+    else
+        echo "WARNING: existing file is not valid JSON. Will back up and replace."
+        cat "$DAEMON_JSON"
+    fi
+else
+    echo "(file does not exist — will be created)"
+fi
+
+# --- Compute target ----------------------------------------------------------
+
+# Deep-merge (jq '*' on objects recurses; on arrays it replaces — we want the
+# replace behavior for `policy` so our policy fully overrides any existing one).
+if [[ -f "$DAEMON_JSON" ]] && jq empty "$DAEMON_JSON" 2>/dev/null; then
+    NEW_CONFIG=$(jq -s '.[0] * .[1]' "$DAEMON_JSON" <(echo "$GC_PATCH"))
+else
+    NEW_CONFIG="$GC_PATCH"
+fi
+
+echo
+echo "=== Proposed $DAEMON_JSON ==="
+echo "$NEW_CONFIG" | jq .
+
+# --- Idempotency check -------------------------------------------------------
+
+if [[ -f "$DAEMON_JSON" ]] && \
+   diff -q <(jq -S . "$DAEMON_JSON" 2>/dev/null) <(echo "$NEW_CONFIG" | jq -S .) >/dev/null 2>&1; then
+    echo
+    echo "Already up to date. Nothing to do."
+    exit 0
+fi
+
+# --- Diff --------------------------------------------------------------------
+
+if [[ -f "$DAEMON_JSON" ]] && jq empty "$DAEMON_JSON" 2>/dev/null; then
+    echo
+    echo "=== Diff (current → proposed) ==="
+    diff -u <(jq -S . "$DAEMON_JSON") <(echo "$NEW_CONFIG" | jq -S .) || true
+fi
+
+# --- Confirm -----------------------------------------------------------------
+
+if [[ "$APPLY" != "--apply" ]]; then
+    echo
+    read -r -p "Apply this config? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+fi
+
+# --- Backup + write ----------------------------------------------------------
+
+if [[ -f "$DAEMON_JSON" ]]; then
+    BACKUP="$DAEMON_JSON.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$DAEMON_JSON" "$BACKUP"
+    echo "Backed up to $BACKUP"
+fi
+
+echo "$NEW_CONFIG" | jq . > "$DAEMON_JSON"
+chmod 644 "$DAEMON_JSON"
+
+echo
+echo "Written $DAEMON_JSON."
+echo
+echo "Next steps:"
+echo "  1. Restart Docker:        systemctl restart docker"
+echo "     (briefly stops all containers ~30s)"
+echo "  2. Verify GC active:      docker info | sed -n '/Builder/,/^\$/p'"
+echo "  3. Check cache usage:     docker buildx du"
