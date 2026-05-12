@@ -101,6 +101,25 @@ def _bucket_name() -> str:
     return os.environ["EVENTS_EXPORT_GCS_BUCKET"].removeprefix("gs://").rstrip("/")
 
 
+def build_content_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Per-content-type sub-config. The Rust worker dispatches on `type` to
+    the matching parser:
+      - "mixpanel"  → parse Mixpanel raw events (this script's original use)
+      - "captured"  → each JSONL line is already a Captured RawEvent
+                      (used for profile $identify backfill via Engage export,
+                      see ../mixpanel_export/engage_export.py)
+    The "captured" parser ignores skip_no_distinct_id / timestamp_offset_seconds
+    so we don't set them on that branch.
+    """
+    if args.content_type == "captured":
+        return {"type": "captured"}
+    return {
+        "type": "mixpanel",
+        "skip_no_distinct_id": args.skip_no_distinct_id,
+        "timestamp_offset_seconds": args.timestamp_offset_seconds,
+    }
+
+
 def build_import_config(args: argparse.Namespace) -> dict[str, Any]:
     """Hand-crafted JSON that mirrors what BatchImportConfigBuilder would
     produce, plus the GCS S3-interop `endpoint_url` override that the Python
@@ -109,11 +128,7 @@ def build_import_config(args: argparse.Namespace) -> dict[str, Any]:
         "data_format": {
             "type": "json_lines",
             "skip_blanks": True,
-            "content": {
-                "type": "mixpanel",
-                "skip_no_distinct_id": args.skip_no_distinct_id,
-                "timestamp_offset_seconds": args.timestamp_offset_seconds,
-            },
+            "content": build_content_config(args),
         },
         "source": {
             "type": "s3_gzip",
@@ -211,7 +226,20 @@ def main() -> None:
         "--skip-no-distinct-id",
         action="store_true",
         default=_env("MIXPANEL_SKIP_NO_DISTINCT_ID", DEFAULTS["MIXPANEL_SKIP_NO_DISTINCT_ID"]).lower() == "true",
-        help="Drop events that have no distinct_id (default: synthesize a UUIDv7)",
+        help="Drop events that have no distinct_id (default: synthesize a UUIDv7). "
+        "Only meaningful for --content-type mixpanel; ignored for captured.",
+    )
+    parser.add_argument(
+        "--content-type",
+        default=os.environ.get("BATCH_IMPORT_CONTENT_TYPE", "mixpanel"),
+        choices=("mixpanel", "captured"),
+        help=(
+            "What's in each JSONL line. 'mixpanel' for raw event exports "
+            "(default; this script's original use). 'captured' for already-"
+            "Captured RawEvents — used by the Mixpanel User Profile backfill "
+            "(see ../mixpanel_export/engage_export.py) which emits $identify "
+            "events with $set / $set_once payloads."
+        ),
     )
     parser.add_argument(
         "--dry-run",
