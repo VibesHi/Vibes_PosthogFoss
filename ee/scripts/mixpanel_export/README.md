@@ -1,4 +1,25 @@
-# Mixpanel daily exporter
+# Mixpanel exporters
+
+Two scripts in this folder, one for each half of a Mixpanel → PostHog migration:
+
+| Script | What it exports | Output shape |
+|---|---|---|
+| `export_daily.py` | **Raw events** via `/api/2.0/export` | `<output>/YYYY/MM/YYYY-MM-DD.jsonl.gz` (one file per UTC day) |
+| `engage_export.py` | **User profiles** via `/api/query/engage` | `<output>/YYYY-MM-DD.jsonl.gz` (one snapshot, NOT day-partitioned) |
+
+Both push to any `fsspec` destination (GCS / S3 / R2 / MinIO / Azure / local FS),
+both share the same Mixpanel service-account auth, both feed PostHog's
+batch-import-worker — but with different `content_type` settings on the
+`BatchImport` row (`mixpanel` for events, `captured` for profiles).
+
+End-to-end migration sequence: see
+[`../mixpanel_import/RUNBOOK.md`](../mixpanel_import/RUNBOOK.md). Phases 1-6
+cover events (use `export_daily.py`), Phase 7 covers profiles (use
+`engage_export.py`).
+
+---
+
+# `export_daily.py` — Mixpanel raw-events daily exporter
 
 One script that pulls one day from Mixpanel raw export and uploads a single
 gzipped JSONL object per day to **any storage** supported by `fsspec`
@@ -230,3 +251,170 @@ object level; on backends without server-side rename (local FS, plain MinIO)
 the rename is a copy+delete that still keeps partial files out of the
 canonical path. On crash, the `.uploading` marker may be left behind and is
 safe to delete manually.
+
+---
+
+# `engage_export.py` — Mixpanel user-profiles exporter
+
+Pulls every user profile via Mixpanel's [Engage API](https://docs.mixpanel.com/docs/export-methods#user-profile-export-via-api)
+and uploads ONE gzipped JSONL snapshot. Each line is a
+[Captured-format](https://github.com/PostHog/posthog/blob/master/rust/batch-import-worker/src/parse/content/captured.rs)
+`$identify` event ready for direct ingestion by `batch-import-worker` —
+no transformation needed PostHog-side.
+
+Default output:
+
+```
+gs://vibes-analytics-events/mixpanel-profiles/moonx/<YYYY-MM-DD>.jsonl.gz
+```
+
+The date is an audit tag (which export?), NOT a partition. Profiles are a
+snapshot, not a time series.
+
+## Why this exists (vs `export_daily.py`)
+
+Mixpanel raw events do NOT include `$set` / `$set_once` payloads. After
+the events import (Phase 4 of the RUNBOOK), Persons in PostHog only have
+properties that happened to appear on event payloads — identity fields
+like `email`, `$created`, `plan`, MRR, `$last_seen`, and anything Mixpanel
+SDKs set via `mixpanel.people.set()` are missing. Engage is the only
+endpoint that exposes the User Profile DB.
+
+This script closes that gap by exporting profiles as synthetic `$identify`
+events. The existing `batch-import-worker` picks them up via the
+`captured` content-type path; no new Rust code, no new Kafka topic.
+
+## What it does
+
+1. POST `https://mixpanel.com/api/query/engage?project_id=<id>` with Basic auth.
+2. Paginate via `session_id` + `page`; honor `Retry-After` on 429.
+3. For each profile, transform → emit one Captured-format JSONL line:
+   - Top-level `event = "$identify"`, `distinct_id`, `timestamp`
+   - `$set` with all mutable profile props (email, name, os, ...)
+   - `$set_once` with creation-time props (`$created`, `$initial_*`)
+   - GeoIP remap (`$city`→`$geoip_city_name`, etc.) to match the events parser
+   - `$insert_id = "mp-profile:<distinct_id>"` → deterministic UUIDv5 →
+     idempotent reruns (ReplacingMergeTree dedupes events on `(team_id, uuid)`)
+   - Drops Mixpanel-internal noise (`$transactions`, `$predict_*`, `$mp_*`,
+     `$ae_total_*`, `$libraries_used`, ...) — see `MP_PROFILE_PROPS_TO_DROP`
+   - Filters sentinel placeholder strings (`<null>`, `<undefined>`) that
+     Engage sometimes substitutes for JSON null — see `PLACEHOLDER_STRINGS`
+   - Synthesizes `$name` from `$first_name`+`$last_name` or lowercase `name`
+   - Back-fills `$email` from lowercase `email`, `$os` from lowercase `os`
+     (common iOS/Android Mixpanel SDK output shapes)
+4. Gzip on the fly, upload via fsspec with `.uploading` → rename for
+   atomic publish.
+
+## Auth
+
+Same as `export_daily.py`:
+
+```bash
+export MIXPANEL_USERNAME='posthog-migration.xxxxxx.mp-service-account'
+export MIXPANEL_PASSWORD='...'
+export MIXPANEL_PROJECT_ID='3193232'
+```
+
+GCS / S3 / FS auth identical too — see the section above.
+
+## Usage
+
+```bash
+# Pilot: 100 profiles to local FS for shape inspection
+python engage_export.py --output ./out/ --limit 100
+
+# Full snapshot to default GCS path
+python engage_export.py
+
+# Filter to a Mixpanel cohort (useful for staged rollouts)
+python engage_export.py --cohort-id 1234567
+
+# Re-export to refresh a same-day snapshot
+python engage_export.py --overwrite
+```
+
+## Importing into PostHog
+
+After verifying the dump (line count, no `"<null>"` strings, identity fields
+look real), point a `BatchImport` row at the file with
+`--content-type captured`:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T \
+    -e POSTHOG_TEAM_ID -e EVENTS_EXPORT_GCS_BUCKET \
+    -e EVENTS_EXPORT_GCS_HMAC_KEY -e EVENTS_EXPORT_GCS_HMAC_SECRET \
+    -e MIXPANEL_IMPORT_GCS_PREFIX='mixpanel-profiles/moonx/<YYYY-MM-DD>.jsonl.gz' \
+    -e KAFKA_SEND_RATE=500 \
+    web python -m ee.scripts.mixpanel_import.create_import \
+        --content-type captured
+```
+
+`KAFKA_SEND_RATE=500` is empirically right for `captured` — each `$identify`
+is ~5-10× the per-event consumer cost of a plain event (PG person upsert
++ KAFKA_PERSON write + override eval). Higher rates risk Kafka lag
+exceeding retention. See the full RUNBOOK Phase 7 for monitoring details.
+
+## Pre-flight: personless mode MUST be OFF
+
+`Team.person_processing_opt_out=True` would cause every `$identify` event
+to get dropped at `ingestion-general` with
+`invalid_event_when_process_person_profile_is_false`. Verify before
+running the BatchImport:
+
+```bash
+./ee/scripts/mixpanel_import/personless_mode.sh status "$POSTHOG_TEAM_ID"
+# want: enabled=False
+```
+
+## Backfilling `$created`
+
+Mixpanel only populates `$created` when an SDK call path explicitly set
+it. Most projects ship profiles without it. After the profile import,
+run [`backfill_created_from_events.py`](../mixpanel_import/backfill_created_from_events.py)
+to derive `$created` from `min(events.timestamp)` per person:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T -e POSTHOG_TEAM_ID web \
+    python -m ee.scripts.mixpanel_import.backfill_created_from_events --dry-run
+
+# Drop --dry-run when satisfied
+```
+
+Idempotent. Skips persons that already have `$created` and persons with no
+events in CH.
+
+## Stats / output
+
+A clean run logs:
+
+```
+DONE object=gs://.../<date>.jsonl.gz engage_total=1127126 fetched=1127126 \
+     written=1127126 no_distinct_id=0 pages=1129 size_bytes=271000996
+```
+
+- `engage_total` — what Mixpanel reported in the first page's `total` field
+- `fetched` — lines actually retrieved from Engage
+- `written` — lines emitted to the gzip stream (= fetched − no_distinct_id)
+- `no_distinct_id` — profiles dropped because `$distinct_id` was empty
+- `pages` — Engage paginations
+- `size_bytes` — local temp file size before upload
+
+For typical Mixpanel projects expect `written / fetched ≈ 1.0`. If
+`no_distinct_id` is non-trivial, the SDK integration was emitting profiles
+without identity, and they would be unusable in PostHog anyway.
+
+## Idempotency
+
+Re-running the export + re-importing the resulting file is safe and cheap:
+
+- Each emitted event has `$insert_id = "mp-profile:<distinct_id>"` →
+  deterministic UUIDv5 → ClickHouse ReplacingMergeTree dedupes events
+  on `(team_id, uuid)`.
+- Consumer-side person upsert refreshes Person row properties (latest
+  `$set` wins, `$set_once` for fields the Person already has is ignored).
+- No `person_distinct_id_overrides` rows created — we reuse the same UUIDs
+  the original event import generated via `uuidFromDistinctId(team_id,
+  distinct_id)`.
+
+This is the monthly-refresh path: re-run `engage_export.py --overwrite`,
+re-create the `BatchImport`. Profile properties update, no duplicates.
