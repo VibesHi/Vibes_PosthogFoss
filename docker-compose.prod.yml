@@ -119,6 +119,13 @@ x-mem-rust-hot:   &mem-rust-hot    { mem_limit: 1g,     memswap_limit: 1g }
 # ~256MB before flushing. Default mem-rust-hot (1g) OOM-killed the worker on
 # the very first 800MB-decompressed daily file. 4g leaves clear headroom.
 x-mem-rust-fat:   &mem-rust-fat    { mem_limit: 4g,     memswap_limit: 4g }
+# property-defs-rs runs hot (~890MB steady, 87% of mem-rust-hot's 1g) because
+# it caches every unique (event, property) pair seen across the team to
+# deduplicate writes to posthog_eventdefinition / posthog_propertydefinition.
+# Cache size grows with property cardinality, not throughput, so it stabilizes
+# but at >1g for teams with rich property taxonomies (e.g. post-Mixpanel
+# migrations that imported diverse profile properties). 1.5g leaves headroom.
+x-mem-rust-defs:  &mem-rust-defs   { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-tiny:       &mem-tiny        { mem_limit: 256m,   memswap_limit: 256m }
 x-mem-xtiny:      &mem-xtiny       { mem_limit: 128m,   memswap_limit: 128m }
 
@@ -904,7 +911,7 @@ services:
         logging: *default-logging
 
     property-defs-rs:
-        <<: [*restart-prod, *mem-rust-hot]
+        <<: [*restart-prod, *mem-rust-defs]
         image: posthog-property-defs-rs
         build:
             context: ./rust
