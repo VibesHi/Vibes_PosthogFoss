@@ -850,6 +850,39 @@ services:
             - seaweedfs
             - temporal
 
+    # Second Temporal worker handling analytics-platform-task-queue.
+    # CSV/XLSX exports, alert checks, and subscriptions all dispatch to that
+    # queue (posthog/settings/temporal.py: ANALYTICS_PLATFORM_TASK_QUEUE).
+    # The default temporal-django-worker above only handles general-purpose-task-queue.
+    # Without this, export workflows queue indefinitely in Temporal and
+    # execute_workflow() blocks the web worker threads until the 35-min timeout.
+    temporal-django-worker-analytics:
+        <<: [*restart-prod, *mem-django-sm]
+        image: posthog-app
+        build: .
+        command: /compose/temporal-django-worker
+        extends:
+            file: docker-compose.base.yml
+            service: temporal-django-worker
+        logging: *default-logging
+        volumes:
+            - ./compose:/compose
+        environment:
+            <<: *pg-env
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            CLICKHOUSE_PASSWORD: $CLICKHOUSE_PASSWORD
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: $OBJECT_STORAGE_PASSWORD
+            TEMPORAL_TASK_QUEUE: analytics-platform-task-queue
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+            - seaweedfs
+            - temporal
+
     cyclotron-janitor:
         # Cyclotron is PostHog's async job queue for HogHooks, pipeline
         # destinations (Slack, BigQuery, S3 export), HogFlow workflows, and

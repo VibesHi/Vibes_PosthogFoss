@@ -42,6 +42,15 @@ def extend_api_router() -> None:
     # routers are guaranteed to exist.
     from posthog.api import environments_router, projects_router, router
 
+    # Swap ExportedAssetViewSet to use our async serializer. DRF reads
+    # serializer_class at request time (via get_serializer_class()), so
+    # patching the class attribute here — before any request arrives — is
+    # sufficient and requires no upstream file changes.
+    from ee.api.exports import AsyncExportedAssetSerializer
+    from posthog.api.exports import ExportedAssetViewSet
+
+    ExportedAssetViewSet.serializer_class = AsyncExportedAssetSerializer
+
     # IMPORTANT: registration order vs. existing `conversations/tickets` and
     # `conversations/views` (registered earlier in posthog/api/__init__.py).
     # DRF emits URL patterns in registration order; Django resolves them
