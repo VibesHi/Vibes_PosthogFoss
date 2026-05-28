@@ -372,33 +372,32 @@ def export_team_day(
 
 
 def upload(target_url: str, local: Path) -> None:
-    """Upload to fsspec target. Writes to `<dest>.uploading` then renames so
-    a partial upload never appears under the canonical name. On native object
-    stores rename is server-side; on local FS / MinIO without versioning it's
-    copy+delete, still race-free relative to readers."""
+    """Upload local file to fsspec target.
+
+    Writes directly to the destination path. Object-storage PUTs are atomic
+    (readers see the complete object or nothing), so the tmp→rename pattern is
+    unnecessary and triggers UploadPartCopy on seaweedfs/minio for files > 5 MB,
+    which seaweedfs does not implement.
+    """
     fs, dest = fsspec.core.url_to_fs(target_url)
     parent = dest.rsplit("/", 1)[0]
     if parent and not fs.exists(parent):
         fs.makedirs(parent, exist_ok=True)
 
-    tmp = dest + ".uploading"
     size = local.stat().st_size
     log.info("upload %s (%.2f MB)", target_url, size / (1024 * 1024))
 
     try:
-        with open(local, "rb") as src, fs.open(tmp, "wb") as dst:
+        with open(local, "rb") as src, fs.open(dest, "wb") as dst:
             while True:
                 chunk = src.read(16 * 1024 * 1024)
                 if not chunk:
                     break
                 dst.write(chunk)
-        if fs.exists(dest):
-            fs.rm(dest)
-        fs.mv(tmp, dest)
     except BaseException:
         try:
-            if fs.exists(tmp):
-                fs.rm(tmp)
+            if fs.exists(dest):
+                fs.rm(dest)
         except Exception:
             pass
         raise
