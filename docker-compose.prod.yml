@@ -105,6 +105,14 @@ x-mem-node-hot:   &mem-node-hot    { mem_limit: 1500m,  memswap_limit: 1500m }
 x-mem-node-sm:    &mem-node-sm     { mem_limit: 384m,   memswap_limit: 512m }
 x-mem-temporal:   &mem-temporal    { mem_limit: 768m,   memswap_limit: 1g }
 x-mem-storage:    &mem-storage     { mem_limit: 384m,   memswap_limit: 512m }
+# Backup container (pg_dumpall | gzip | aws s3 cp). Peak RSS tracks DB
+# content, not a constant: pg_dump buffers each row whole and aws-cli's
+# multipart buffers sit in the same cgroup. The original 384m (*mem-storage)
+# cap started memcg-OOM-killing pg_dump nightly in May 2026 once the DB
+# outgrew it, and the truncated stream still uploaded as a plausible-looking
+# .sql.gz. 1g + ~0.5g swap headroom; if the nightly run gets near the cap
+# in `docker stats` again, bump BEFORE dumps start truncating again.
+x-mem-backup:     &mem-backup      { mem_limit: 1g,     memswap_limit: 1500m }
 # Rust idle 13-90MB. Default cap stays 256m for low-volume rust services.
 x-mem-rust:       &mem-rust        { mem_limit: 256m,   memswap_limit: 384m }
 # Hot rust (capture, replay-capture, feature-flags). Tuned for max ingestion
@@ -1278,12 +1286,11 @@ services:
     #   docker compose exec -it backup /usr/local/bin/backup-scripts/restore-pg.sh
     backup:
         profiles: [backup]
-        # mem-storage (384m) not mem-tiny (256m): aws-cli is Python (~80MB
-        # baseline) and its multipart upload buffers up to ~80MB across
-        # concurrent chunks during `cp -` from stdin. With pg_dumpall +
-        # gzip in the same pipeline, peak RSS during a multi-GB PG dump
-        # crowds 256m. 384m gives ~150% headroom.
-        <<: [*restart-prod, *mem-storage]
+        # Dedicated cap -- see x-mem-backup comment. Was *mem-storage (384m),
+        # which pg_dump outgrew in May 2026: nightly memcg OOM-kills produced
+        # truncated-but-uploaded dumps for weeks. Don't re-share an anchor
+        # with objectstorage/seaweedfs; their sizing is unrelated to DB size.
+        <<: [*restart-prod, *mem-backup]
         image: posthog-backup
         build:
             context: ./docker/backup
