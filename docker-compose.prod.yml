@@ -969,6 +969,22 @@ services:
             file: docker-compose.base.yml
             service: property-defs-rs
         logging: *default-logging
+        # Dual-purpose healthcheck: liveness probe AND metrics-buffer drain.
+        # The prometheus recorder (metrics-exporter-prometheus, installed by
+        # common/serve_metrics with no upkeep task and no disable flag)
+        # buffers every histogram sample as a raw f64 until something renders
+        # /metrics. Unscraped, this service accrued ~47MB/day until its
+        # cgroup OOM-killed it (~monthly cycle; confirmed 2026-08 -- the
+        # "~890MB steady cache" note on x-mem-rust-defs was a misdiagnosis
+        # of this, real cache is ~40MB). A 60s in-container scrape caps the
+        # buffers at one minute of samples. Do NOT copy this to capture:
+        # its /metrics intentionally 404s (EXPORT_PROMETHEUS=false).
+        healthcheck:
+            test: ["CMD", "curl", "-sf", "--max-time", "30", "-o", "/dev/null", "http://localhost:3301/metrics"]
+            interval: 60s
+            timeout: 35s
+            retries: 3
+            start_period: 2m
         environment:
             <<: *pg-env
         depends_on:
