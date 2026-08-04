@@ -932,6 +932,15 @@ services:
             file: docker-compose.base.yml
             service: capture
         logging: *default-logging
+        environment:
+            # Nothing on this host scrapes /metrics, and capture's prometheus
+            # recorder (metrics-exporter-prometheus via install_recorder(), no
+            # upkeep task) buffers every histogram sample as a raw f64 until a
+            # scrape drains it. Unscraped, each replica leaks ~33MB/day until
+            # its cgroup OOM-kills it (~6-week cycle, confirmed by live memory
+            # forensics 2026-08). Flip back to 'true' only after adding a
+            # Prometheus/alloy scrape job for capture:3000.
+            EXPORT_PROMETHEUS: 'false'
         # Horizontal scale for max event ingestion. Single rust capture process
         # is bounded by one CPU core (~5-10k req/s). On 8-core/30g hardware
         # 3 replicas safely use ~3 cores while leaving room for kafka,
