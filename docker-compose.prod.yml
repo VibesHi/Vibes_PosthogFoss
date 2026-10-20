@@ -162,7 +162,7 @@ x-pg-env: &pg-env
 
 services:
     db:
-        <<: *mem-postgres
+        <<: [*restart-prod, *mem-postgres]
         extends:
             file: docker-compose.base.yml
             service: db
@@ -216,7 +216,7 @@ services:
             - postgres-data:/var/lib/postgresql/data
 
     redis7:
-        <<: *mem-redis
+        <<: [*restart-prod, *mem-redis]
         extends:
             file: docker-compose.base.yml
             service: redis7
@@ -245,14 +245,13 @@ services:
         # Note: please keep the default version in sync across
         #       `posthog` and the `charts-clickhouse` repos
         #
-        <<: *mem-clickhouse
+        <<: [*restart-prod, *mem-clickhouse]
         extends:
             file: docker-compose.base.yml
             service: clickhouse
         # Pin via .env (CLICKHOUSE_SERVER_IMAGE) for reproducible deploys.
         # base.yml falls back to 26.3.9.8 if unset.
         image: ${CLICKHOUSE_SERVER_IMAGE:-clickhouse/clickhouse-server:26.3.9.8}
-        restart: on-failure
         logging: *default-logging
         # CLICKHOUSE_PASSWORD is read by the server itself (consumed by users.d.prod
         # overlay via `from_env` for the `default` user's <password> tag). The
@@ -295,6 +294,7 @@ services:
         # heap + JVM overhead pushes RSS to 98% of 384m on idle, OOM-loops
         # under any DDL burst. CH ReplicatedMergeTree depends on this; if ZK
         # dies, all CH writes block.
+        <<: *restart-prod
         mem_limit: 768m
         memswap_limit: 768m
         extends:
@@ -316,7 +316,7 @@ services:
             - zookeeper-data:/data
             - zookeeper-logs:/logs
     kafka:
-        <<: *mem-kafka
+        <<: [*restart-prod, *mem-kafka]
         extends:
             file: docker-compose.base.yml
             service: kafka
@@ -705,12 +705,11 @@ services:
             - web
             - livestream
     objectstorage:
-        <<: *mem-storage
+        <<: [*restart-prod, *mem-storage]
         extends:
             file: docker-compose.base.yml
             service: objectstorage
 
-        restart: on-failure
         logging: *default-logging
         # Override the well-known `object_storage_root_password` default from
         # base.yml. MINIO_ROOT_USER stays as `object_storage_root_user` — only
@@ -727,12 +726,11 @@ services:
             - '127.0.0.1:19001:19001'
 
     seaweedfs:
-        <<: *mem-storage
+        <<: [*restart-prod, *mem-storage]
         extends:
             file: docker-compose.base.yml
             service: seaweedfs
         container_name: '${SEAWEEDFS_DOCKER_NAME:-seaweedfs-main}'
-        restart: on-failure
         logging: *default-logging
         ports:
             - '127.0.0.1:8333:8333' # S3 API
@@ -773,7 +771,7 @@ services:
 
     # Temporal containers
     temporal:
-        <<: *mem-temporal
+        <<: [*restart-prod, *mem-temporal]
         extends:
             file: docker-compose.base.yml
             service: temporal
@@ -802,6 +800,7 @@ services:
         # cgroup OOM-killer fires every ~10 min once Lucene merges and ingest
         # pipelines warm up. 1g gives ~600 MiB headroom above heap+direct,
         # which keeps it stable under PostHog's normal load.
+        <<: *restart-prod
         mem_limit: 1g
         memswap_limit: 1g
         extends:
@@ -809,7 +808,7 @@ services:
             service: elasticsearch
         logging: *default-logging
     temporal-admin-tools:
-        <<: *mem-xtiny
+        <<: [*restart-prod, *mem-xtiny]
         extends:
             file: docker-compose.base.yml
             service: temporal-admin-tools
@@ -817,7 +816,7 @@ services:
         depends_on:
             - temporal
     temporal-ui:
-        <<: *mem-tiny
+        <<: [*restart-prod, *mem-tiny]
         extends:
             file: docker-compose.base.yml
             service: temporal-ui
